@@ -113,7 +113,7 @@ class NHInvestClient:
 
         # 시장가 주문: nmn_pr_tp_cd = "03", 지정가 = "01"
         is_market = (price == 0)
-        nmn_pr_tp_cd = "02" if is_market else "01"
+        nmn_pr_tp_cd = "05" if is_market else "01"
         order_price = 0 if is_market else int(price)
 
         payload = {
