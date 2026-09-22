@@ -92,12 +92,13 @@ class NHInvestClient:
 
         return float(str(price).replace(",", "").strip())
 
-    def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
+def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
         """
         나무증권 공식 명세:
         - 매수: /krstock/order/v1/cashBuy
         - 매도: /krstock/order/v1/cashSell
         """
+        # 1. 매수/매도 엔드포인트 자동 분기
         endpoint = "/krstock/order/v1/cashBuy" if order_type == "BUY" else "/krstock/order/v1/cashSell"
         url = f"{self.BASE_URL}{endpoint}"
 
@@ -111,11 +112,12 @@ class NHInvestClient:
             "mac_address": ""
         }
 
-     # 시장가 주문: nmn_pr_tp_cd = "05" (또는 "02"), 지정가 = "01"
+        # 2. 호가구분코드: 시장가 = "05", 지정가 = "01"
         is_market = (price == 0)
         nmn_pr_tp_cd = "05" if is_market else "01"
         order_price = 0 if is_market else int(price)
 
+        # 3. 요청시장코드: KRX(한국거래소)로 고정하여 SOR 제약(IOC 필수 등) 사전 차단
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
@@ -125,7 +127,7 @@ class NHInvestClient:
                 "nmn_pr_tp_cd": nmn_pr_tp_cd,
                 "orr_cnd_dit_cd": "00",              # 조건 없음
                 "ssl_nmn_pr_dit_cd": "00",
-                "rmt_mkt_cd": "KRX",                 # [핵심 수정] SOR -> KRX (정규 한국거래소)
+                "rmt_mkt_cd": "KRX",                 # 매수/매도 공통 정규시장 지정
                 "sor_mkt_sli_yn": "N"
             }
         }
