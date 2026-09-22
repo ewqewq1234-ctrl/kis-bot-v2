@@ -139,7 +139,6 @@ def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BU
         except Exception as e:
             print(f"[주문 전송 오류]: {e}")
             return None
-참고: 나무증권 가이드에서 시장가 코드가 만약 01이나 다른 코드라면 증권사 응답 메시지에 "호가구분코드 오류" 형태로 내려오니, 로그의 [주문 API 결과]를 확인하면 바로 세팅할 수 있습니다.
 
 2. run_cloud.py에서 주문 호출 확인
 run_cloud.py 파일의 1단계 진입 부분에서 client.send_order(...)가 호출되고 있는지 확인합니다.
