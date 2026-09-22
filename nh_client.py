@@ -111,7 +111,7 @@ class NHInvestClient:
             "mac_address": ""
         }
 
-        # 시장가 주문: nmn_pr_tp_cd = "03", 지정가 = "01"
+     # 시장가 주문: nmn_pr_tp_cd = "05" (또는 "02"), 지정가 = "01"
         is_market = (price == 0)
         nmn_pr_tp_cd = "05" if is_market else "01"
         order_price = 0 if is_market else int(price)
@@ -123,9 +123,9 @@ class NHInvestClient:
                 "orr_qty": int(qty),
                 "orr_pr": order_price,
                 "nmn_pr_tp_cd": nmn_pr_tp_cd,
-                "orr_cnd_dit_cd": "00",
+                "orr_cnd_dit_cd": "00",              # 조건 없음
                 "ssl_nmn_pr_dit_cd": "00",
-                "rmt_mkt_cd": "SOR",
+                "rmt_mkt_cd": "KRX",                 # [핵심 수정] SOR -> KRX (정규 한국거래소)
                 "sor_mkt_sli_yn": "N"
             }
         }
