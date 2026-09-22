@@ -6,7 +6,7 @@ on:
     - cron: '0 0-6 * * 1-5'
     # 2. 장 마감 일일 결산 브리핑 실행 (KST 15:35 -> UTC 06:35)
     - cron: '35 6 * * 1-5'
-  workflow_dispatch: # 수동 즉시 실행 지원
+  workflow_dispatch:
 
 jobs:
   trade:
@@ -39,5 +39,6 @@ jobs:
         run: |
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          git add state.json tokens.json
-          git diff --quiet && git diff --staged --quiet || (git commit -m "Auto: Update state
+          git add state.json tokens.json || true
+          git commit -m "Auto: Update state and tokens [skip ci]" || true
+          git push || true
