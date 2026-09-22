@@ -93,40 +93,77 @@ class NHInvestClient:
         return float(str(price).replace(",", "").strip())
 
 def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
-        """실전 주문 전송 (나무증권 REST 규격)"""
-        url = f"{self.BASE_URL}/krstock/order/v1/order"
-        
-        # 헤더 설정
+        """
+        나무증권 공식 명세:
+        - 매수: /krstock/order/v1/cashBuy
+        - 매도: /krstock/order/v1/cashSell
+        """
+        endpoint = "/krstock/order/v1/cashBuy" if order_type == "BUY" else "/krstock/order/v1/cashSell"
+        url = f"{self.BASE_URL}{endpoint}"
+
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {self.access_token}",
             "appkey": self.app_key,
-            "appsecretkey": self.app_secret
+            "appsecretkey": self.app_secret,
+            "cts": "",
+            "cts_flag": "",
+            "mac_address": ""
         }
-        
-        # 계좌번호 분리 (8자리 종합계좌 + 2자리 상품코드)
-        clean_acc = str(account_no).replace("-", "").strip()
-        cano = clean_acc[:8]
-        acnt_prdt_cd = clean_acc[8:] if len(clean_acc) >= 10 else "01"
 
-        # 주문 요청 데이터 (시장가 기본)
+        # 시장가: nmn_pr_tp_cd = "03" (보통 시장가), 지정가: "01"
+        # 가격이 0이면 시장가 주문
+        is_market = (price == 0)
+        nmn_pr_tp_cd = "03" if is_market else "01"
+        order_price = 0 if is_market else int(price)
+
+        # 나무증권 공식 Input_0 바디 규격
         payload = {
             "Input_0": {
-                "cano": cano,
-                "acnt_prdt_cd": acnt_prdt_cd,
-                "iem_cd": ticker,
-                "ord_dvsn": "01" if price == 0 else "00",  # 01: 시장가
-                "ord_qty": str(int(qty)),
-                "ord_unpr": str(int(price)),
-                "trd_dvsn": "02" if order_type == "BUY" else "01"  # 02: 매수, 01: 매도
+                "act_no": str(account_no).replace("-", "").strip(),
+                "iem_cd": str(ticker),
+                "orr_qty": int(qty),
+                "orr_pr": order_price,
+                "nmn_pr_tp_cd": nmn_pr_tp_cd,
+                "orr_cnd_dit_cd": "00",
+                "ssl_nmn_pr_dit_cd": "00",
+                "rmt_mkt_cd": "SOR",
+                "sor_mkt_sli_yn": "N"
             }
         }
 
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=10)
-            print(f"[주문 전송 결과] 상태코드: {res.status_code} | 본문: {res.text}")
+            print(f"[주문 API 결과] {order_type} {qty}주 | HTTP {res.status_code} | 본문: {res.text}")
             return res.json()
         except Exception as e:
-            print(f"[주문 요청 에러]: {e}")
+            print(f"[주문 전송 오류]: {e}")
             return None
+참고: 나무증권 가이드에서 시장가 코드가 만약 01이나 다른 코드라면 증권사 응답 메시지에 "호가구분코드 오류" 형태로 내려오니, 로그의 [주문 API 결과]를 확인하면 바로 세팅할 수 있습니다.
+
+2. run_cloud.py에서 주문 호출 확인
+run_cloud.py 파일의 1단계 진입 부분에서 client.send_order(...)가 호출되고 있는지 확인합니다.
+
+Python
+    # 1단계: 미보유 상태 최초 진입
+    if state["current_stage"] == 0 and not state["pyramid_mode"]:
+        qty = int(stage_budgets[0] // price)
+        if qty > 0:
+            # 아래 주문 함수가 정상적으로 작동해야 합니다.
+            order_res = client.send_order(account_no, ticker="069500", qty=qty, price=0, order_type="BUY")
             
+            state["shares"] = qty
+            state["avg_price"] = price
+            state["last_buy_price"] = price
+            state["current_stage"] = 1
+            state["holding_bars"] = 0
+            
+            msg = (
+                f"🟢 <b>[1단계 신규 매수 (자동복리)]</b>\n"
+                f"• 배정 예산: {stage_budgets[0]:,.0f}원 (자본의 10%)\n"
+                f"• 매수가: {price:,.0f}원 ({qty}주)\n"
+                f"• 총 운용자본: {total_capital:,.0f}원"
+            )
+            send_telegram_message(msg)
+            save_state(state)
+        return
