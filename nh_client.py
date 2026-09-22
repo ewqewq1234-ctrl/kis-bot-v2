@@ -1,40 +1,83 @@
-def get_current_price(self, ticker="069500"):
+import os
+import json
+import requests
+from datetime import datetime, timedelta
+
+class NHInvestClient:
+    BASE_URL = "https://api.nhplug.com:8443"
+
+    def __init__(self, app_key=None, app_secret=None):
+        self.app_key = app_key or os.getenv("NH_APP_KEY")
+        self.app_secret = app_secret or os.getenv("NH_APP_SECRET")
+        self.token_file = "tokens.json"
+        self.access_token = None
+        self._load_or_refresh_token()
+
+    def _load_or_refresh_token(self):
+        """24시간 유효 토큰 관리 및 재사용"""
+        if os.path.exists(self.token_file):
+            try:
+                with open(self.token_file, "r") as f:
+                    data = json.load(f)
+                    expires_at = datetime.fromisoformat(data.get("expires_at", "2000-01-01"))
+                    if datetime.now() < expires_at - timedelta(hours=1):
+                        self.access_token = data.get("access_token")
+                        return
+            except Exception:
+                pass
+        self._issue_token()
+
+    def _issue_token(self):
+        """나무증권 OAuth2 접근 토큰 발급"""
+        url = f"{self.BASE_URL}/oauth2/token"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "grant_type": "client_credentials",
+            "scope": "oob"
+        }
+        res = requests.post(url, headers=headers, data=data, timeout=10)
+        res.raise_for_status()
+        token_info = res.json()
+
+        self.access_token = token_info["access_token"]
+        expires_in = token_info.get("expires_in", 86400)
+        expires_at = datetime.now() + timedelta(seconds=expires_in)
+
+        with open(self.token_file, "w") as f:
+            json.dump({
+                "access_token": self.access_token,
+                "expires_at": expires_at.isoformat()
+            }, f)
+
+    def get_current_price(self, ticker="069500"):
         """
-        나무증권 공식 규격: /krstock/quote/v1/currentPrice (POST)
-        KODEX 200 종목코드: 069500
+        나무증권 현재가 조회: /krstock/quote/v1/currentPrice (POST)
         """
         url = f"{self.BASE_URL}/krstock/quote/v1/currentPrice"
-        
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {self.access_token}",
             "appkey": self.app_key,
             "appsecretkey": self.app_secret
         }
-        
-        # 나무증권 샘플 규격 반영 (Input_0 구조)
         payload = {
             "Input_0": {
                 "market_cd": "KRX",
                 "iem_cd": ticker
             }
         }
-        
         res = requests.post(url, headers=headers, json=payload, timeout=5)
-        
         if res.status_code != 200:
             print(f"[시세 조회 실패] HTTP {res.status_code}: {res.text}")
             res.raise_for_status()
-            
+
         data = res.json()
-        
-        # 응답 블록에서 현재가 필드 추출
-        # 나무증권 응답은 보통 Output_0 또는 data 블록 안에 들어옵니다.
         output = data.get("Output_0") or data.get("output") or data.get("output1") or data
         if isinstance(output, list) and len(output) > 0:
             output = output[0]
-            
-        # 가격 필드명(prc, now_prc, stck_prpr, cur_prc 등) 유연하게 매핑
+
         price = (
             output.get("cur_prc") or 
             output.get("prc") or 
@@ -42,10 +85,34 @@ def get_current_price(self, ticker="069500"):
             output.get("stck_prpr") or 
             output.get("clpr")
         )
-        
+
         if price is None:
-            # 필드명을 확인할 수 있도록 전체 응답 출력
             print(f"[응답 확인용] 전체 데이터: {data}")
-            raise KeyError("현재가 필드를 찾을 수 없습니다. 응답 구조를 확인해주세요.")
-            
+            raise KeyError("현재가 필드를 찾을 수 없습니다.")
+
         return float(str(price).replace(",", "").strip())
+
+    def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
+        """실전 주문 전송 (시장가/지정가)"""
+        url = f"{self.BASE_URL}/krstock/order/v1/order"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret
+        }
+        payload = {
+            "Input_0": {
+                "account_no": account_no,
+                "iem_cd": ticker,
+                "order_type": "01" if order_type == "BUY" else "02",
+                "order_qty": int(qty),
+                "order_price": int(price)
+            }
+        }
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=5)
+            return res.json()
+        except Exception as e:
+            print(f"[주문 실패]: {e}")
+            return None
