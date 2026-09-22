@@ -92,27 +92,41 @@ class NHInvestClient:
 
         return float(str(price).replace(",", "").strip())
 
-    def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
-        """실전 주문 전송 (시장가/지정가)"""
+def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
+        """실전 주문 전송 (나무증권 REST 규격)"""
         url = f"{self.BASE_URL}/krstock/order/v1/order"
+        
+        # 헤더 설정
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {self.access_token}",
             "appkey": self.app_key,
             "appsecretkey": self.app_secret
         }
+        
+        # 계좌번호 분리 (8자리 종합계좌 + 2자리 상품코드)
+        clean_acc = str(account_no).replace("-", "").strip()
+        cano = clean_acc[:8]
+        acnt_prdt_cd = clean_acc[8:] if len(clean_acc) >= 10 else "01"
+
+        # 주문 요청 데이터 (시장가 기본)
         payload = {
             "Input_0": {
-                "account_no": account_no,
+                "cano": cano,
+                "acnt_prdt_cd": acnt_prdt_cd,
                 "iem_cd": ticker,
-                "order_type": "01" if order_type == "BUY" else "02",
-                "order_qty": int(qty),
-                "order_price": int(price)
+                "ord_dvsn": "01" if price == 0 else "00",  # 01: 시장가
+                "ord_qty": str(int(qty)),
+                "ord_unpr": str(int(price)),
+                "trd_dvsn": "02" if order_type == "BUY" else "01"  # 02: 매수, 01: 매도
             }
         }
+
         try:
-            res = requests.post(url, headers=headers, json=payload, timeout=5)
+            res = requests.post(url, headers=headers, json=payload, timeout=10)
+            print(f"[주문 전송 결과] 상태코드: {res.status_code} | 본문: {res.text}")
             return res.json()
         except Exception as e:
-            print(f"[주문 실패]: {e}")
+            print(f"[주문 요청 에러]: {e}")
             return None
+            
