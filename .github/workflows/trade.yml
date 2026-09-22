@@ -1,0 +1,38 @@
+name: ETF Grid Trading Bot
+
+on:
+  schedule:
+    # 평일(월~금) 한국 시간 09:00 ~ 15:00 매시 정각 (UTC 기준 00:00 ~ 06:00)
+    - cron: '0 0,1,2,3,4,5,6 * * 1-5'
+  workflow_dispatch: # 버튼 눌러서 즉시 수동 실행도 가능
+
+jobs:
+  trade:
+    runs-on: ubuntu-latest
+    steps:
+      - name: 저장소 코드 불러오기
+        uses: actions/checkout@v4
+
+      - name: 파이썬 환경 설정
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: 패키지 설치
+        run: |
+          pip install requests python-dotenv
+
+      - name: 봇 1회 체크 및 매매 실행
+        env:
+          NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
+          NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
+          NH_ACCOUNT_NO: ${{ secrets.NH_ACCOUNT_NO }}
+        run: |
+          python run_cloud.py
+
+      - name: 변경된 상태(state.json) 및 토큰 자동 커밋/저장
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add state.json tokens.json || true
+          git diff --quiet && git diff --staged --quiet || (git commit -m "update: trading state" && git push)
