@@ -92,7 +92,7 @@ class NHInvestClient:
 
         return float(str(price).replace(",", "").strip())
 
-def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
+    def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
         """
         나무증권 공식 명세:
         - 매수: /krstock/order/v1/cashBuy
@@ -111,13 +111,11 @@ def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BU
             "mac_address": ""
         }
 
-        # 시장가: nmn_pr_tp_cd = "03" (보통 시장가), 지정가: "01"
-        # 가격이 0이면 시장가 주문
+        # 시장가 주문: nmn_pr_tp_cd = "03", 지정가 = "01"
         is_market = (price == 0)
         nmn_pr_tp_cd = "03" if is_market else "01"
         order_price = 0 if is_market else int(price)
 
-        # 나무증권 공식 Input_0 바디 규격
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
@@ -139,30 +137,3 @@ def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BU
         except Exception as e:
             print(f"[주문 전송 오류]: {e}")
             return None
-
-2. run_cloud.py에서 주문 호출 확인
-run_cloud.py 파일의 1단계 진입 부분에서 client.send_order(...)가 호출되고 있는지 확인합니다.
-
-Python
-    # 1단계: 미보유 상태 최초 진입
-    if state["current_stage"] == 0 and not state["pyramid_mode"]:
-        qty = int(stage_budgets[0] // price)
-        if qty > 0:
-            # 아래 주문 함수가 정상적으로 작동해야 합니다.
-            order_res = client.send_order(account_no, ticker="069500", qty=qty, price=0, order_type="BUY")
-            
-            state["shares"] = qty
-            state["avg_price"] = price
-            state["last_buy_price"] = price
-            state["current_stage"] = 1
-            state["holding_bars"] = 0
-            
-            msg = (
-                f"🟢 <b>[1단계 신규 매수 (자동복리)]</b>\n"
-                f"• 배정 예산: {stage_budgets[0]:,.0f}원 (자본의 10%)\n"
-                f"• 매수가: {price:,.0f}원 ({qty}주)\n"
-                f"• 총 운용자본: {total_capital:,.0f}원"
-            )
-            send_telegram_message(msg)
-            save_state(state)
-        return
