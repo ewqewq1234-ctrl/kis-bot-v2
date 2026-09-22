@@ -1,7 +1,7 @@
 {
   "initial_seed": 3000000,
   "total_capital": 3000000,
-  "current_stage": 1,
+  "current_stage": 0,
   "shares": 2,
   "avg_price": 113955.0,
   "last_buy_price": 113955.0,
