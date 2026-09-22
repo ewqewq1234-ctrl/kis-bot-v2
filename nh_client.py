@@ -52,9 +52,7 @@ class NHInvestClient:
             }, f)
 
     def get_current_price(self, ticker="069500"):
-        """
-        나무증권 현재가 조회: /krstock/quote/v1/currentPrice (POST)
-        """
+        """나무증권 현재가 조회"""
         url = f"{self.BASE_URL}/krstock/quote/v1/currentPrice"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -87,18 +85,12 @@ class NHInvestClient:
         )
 
         if price is None:
-            print(f"[응답 확인용] 전체 데이터: {data}")
             raise KeyError("현재가 필드를 찾을 수 없습니다.")
 
         return float(str(price).replace(",", "").strip())
 
-def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
-        """
-        나무증권 공식 명세:
-        - 매수: /krstock/order/v1/cashBuy
-        - 매도: /krstock/order/v1/cashSell
-        """
-        # 1. 매수/매도 엔드포인트 자동 분기
+    def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
+        """나무증권 매수/매도 주문 전송"""
         endpoint = "/krstock/order/v1/cashBuy" if order_type == "BUY" else "/krstock/order/v1/cashSell"
         url = f"{self.BASE_URL}{endpoint}"
 
@@ -112,12 +104,11 @@ def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BU
             "mac_address": ""
         }
 
-        # 2. 호가구분코드: 시장가 = "05", 지정가 = "01"
+        # 시장가: "05", 보통(지정가): "01"
         is_market = (price == 0)
         nmn_pr_tp_cd = "05" if is_market else "01"
         order_price = 0 if is_market else int(price)
 
-        # 3. 요청시장코드: KRX(한국거래소)로 고정하여 SOR 제약(IOC 필수 등) 사전 차단
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
@@ -125,9 +116,9 @@ def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BU
                 "orr_qty": int(qty),
                 "orr_pr": order_price,
                 "nmn_pr_tp_cd": nmn_pr_tp_cd,
-                "orr_cnd_dit_cd": "00",              # 조건 없음
+                "orr_cnd_dit_cd": "00",
                 "ssl_nmn_pr_dit_cd": "00",
-                "rmt_mkt_cd": "KRX",                 # 매수/매도 공통 정규시장 지정
+                "rmt_mkt_cd": "KRX",
                 "sor_mkt_sli_yn": "N"
             }
         }
