@@ -27,7 +27,7 @@ class NHInvestClient:
                 pass
         self._issue_token()
 
-def _issue_token(self):
+    def _issue_token(self):
         """나무증권 OAuth2 접근 토큰 신규 발급 (WAF 차단 회피 헤더 적용)"""
         url = f"{self.BASE_URL}/oauth2/token"
         headers = {
@@ -57,7 +57,7 @@ def _issue_token(self):
                     "access_token": self.access_token,
                     "expires_at": expires_at.isoformat()
                 }, f, indent=2)
-            print("[토큰 발급 성공] 신규 토큰이 정상적으로 저장되었습니다.")
+            print("[토큰 발급 완료] 새로운 접근 토큰이 저장되었습니다.")
         except Exception as e:
             print(f"[토큰 발급 중 치명적 오류]: {e}")
             raise
@@ -71,9 +71,9 @@ def _issue_token(self):
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {self.access_token}",
                 "appkey": self.app_key,
-                "appsecretkey": self.app_secret
+                "appsecretkey": self.app_secret,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
             }
-            # 명세서 필수 파라미터 view_main_yn 추가
             payload = {
                 "Input_0": {
                     "market_cd": "KRX",
@@ -83,7 +83,6 @@ def _issue_token(self):
             }
             res = requests.post(url, headers=headers, json=payload, timeout=5)
 
-            # 토큰 무효화(IGW40043) 에러 시 토큰 재발급 후 재시도
             if "IGW40043" in res.text or res.status_code == 401:
                 print("[토큰 만료 감지] 토큰을 즉시 재발급받고 재시도합니다...")
                 self._issue_token()
@@ -95,7 +94,6 @@ def _issue_token(self):
 
             data = res.json()
             
-            # Output_1(종목 요약) 또는 Output_0(체결 틱)에서 stck_prpr 파싱
             price = None
             if "Output_1" in data and isinstance(data["Output_1"], dict):
                 price = data["Output_1"].get("stck_prpr")
@@ -120,12 +118,12 @@ def _issue_token(self):
                 "Authorization": f"Bearer {self.access_token}",
                 "appkey": self.app_key,
                 "appsecretkey": self.app_secret,
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "cts": "",
                 "cts_flag": "",
                 "mac_address": ""
             }
 
-            # 시장가: "05", 보통(지정가): "01"
             is_market = (price == 0)
             nmn_pr_tp_cd = "05" if is_market else "01"
             order_price = 0 if is_market else int(price)
