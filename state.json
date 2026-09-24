@@ -5,11 +5,13 @@
   "shares": 7,
   "avg_price": 112214.28571428571,
   "last_buy_price": 111540.0,
-  "holding_bars": 12,
+  "first_buy_date": "",
   "pyramid_mode": false,
   "pyramid_shares": 0,
   "highest_price": 0.0,
   "total_profit_accumulated": 0,
   "cycle_win_count": 0,
-  "last_summary_date": "2026-09-23"
+  "last_summary_date": "2026-09-23",
+  "last_order_time": "",
+  "holding_bars": 12
 }
