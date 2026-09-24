@@ -27,22 +27,21 @@ class NHInvestClient:
                 pass
         self._issue_token()
 
-    def _issue_token(self):
-        """나무증권 OAuth2 접근 토큰 신규 발급 (WAF 차단 회피 헤더 적용)"""
+   def _issue_token(self):
+        """나무증권 OAuth2 접근 토큰 신규 발급"""
         url = f"{self.BASE_URL}/oauth2/token"
         headers = {
-            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+            "Content-Type": "application/x-www-form-urlencoded"
         }
-        payload_str = (
-            f"appkey={self.app_key}&"
-            f"appsecretkey={self.app_secret}&"
-            f"grant_type=client_credentials&"
-            f"scope=oob"
-        )
+        data = {
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "grant_type": "client_credentials",
+            "scope": "oob"
+        }
         
         try:
-            res = requests.post(url, headers=headers, data=payload_str, timeout=10)
+            res = requests.post(url, headers=headers, data=data, timeout=10)
             if res.status_code != 200:
                 print(f"[토큰 발급 실패] HTTP {res.status_code} | 본문: {res.text}")
                 res.raise_for_status()
