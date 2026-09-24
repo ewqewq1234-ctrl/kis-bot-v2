@@ -28,16 +28,16 @@ class NHInvestClient:
         self._issue_token()
 
     def _issue_token(self):
-        """나무증권 OAuth2 접근 토큰 신규 발급"""
+        """나무증권 OAuth2 접근 토큰 신규 발급 (curl 동일 규격)"""
         url = f"{self.BASE_URL}/oauth2/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = {
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "grant_type": "client_credentials",
-            "scope": "oob"
-        }
-        res = requests.post(url, headers=headers, data=data, timeout=10)
+        headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}
+        payload_str = (
+            f"appkey={self.app_key}&"
+            f"appsecretkey={self.app_secret}&"
+            f"grant_type=client_credentials&"
+            f"scope=oob"
+        )
+        res = requests.post(url, headers=headers, data=payload_str, timeout=10)
         res.raise_for_status()
         token_info = res.json()
 
@@ -49,12 +49,12 @@ class NHInvestClient:
             json.dump({
                 "access_token": self.access_token,
                 "expires_at": expires_at.isoformat()
-            }, f)
+            }, f, indent=2)
         print("[토큰 발급 완료] 새로운 접근 토큰이 저장되었습니다.")
 
     def get_current_price(self, ticker="069500"):
-        """나무증권 현재가 조회 (만료 시 자동 재발급 1회 재시도)"""
-        url = f"{self.BASE_URL}/krstock/quote/v1/currentPrice"
+        """나무증권 현재가 체결추이 조회 (/krstock/quote/v1/currentExecution)"""
+        url = f"{self.BASE_URL}/krstock/quote/v1/currentExecution"
         
         for attempt in range(2):
             headers = {
@@ -63,10 +63,12 @@ class NHInvestClient:
                 "appkey": self.app_key,
                 "appsecretkey": self.app_secret
             }
+            # 명세서 필수 파라미터 view_main_yn 추가
             payload = {
                 "Input_0": {
                     "market_cd": "KRX",
-                    "iem_cd": ticker
+                    "iem_cd": str(ticker),
+                    "view_main_yn": "N"
                 }
             }
             res = requests.post(url, headers=headers, json=payload, timeout=5)
@@ -82,20 +84,16 @@ class NHInvestClient:
                 res.raise_for_status()
 
             data = res.json()
-            output = data.get("Output_0") or data.get("output") or data.get("output1") or data
-            if isinstance(output, list) and len(output) > 0:
-                output = output[0]
-
-            price = (
-                output.get("cur_prc") or 
-                output.get("prc") or 
-                output.get("now_prc") or 
-                output.get("stck_prpr") or 
-                output.get("clpr")
-            )
+            
+            # Output_1(종목 요약) 또는 Output_0(체결 틱)에서 stck_prpr 파싱
+            price = None
+            if "Output_1" in data and isinstance(data["Output_1"], dict):
+                price = data["Output_1"].get("stck_prpr")
+            elif "Output_0" in data and isinstance(data["Output_0"], list) and len(data["Output_0"]) > 0:
+                price = data["Output_0"][0].get("stck_prpr")
 
             if price is None:
-                raise KeyError("현재가 필드를 찾을 수 없습니다.")
+                raise KeyError(f"현재가(stck_prpr) 필드를 찾을 수 없습니다: {res.text}")
 
             return float(str(price).replace(",", "").strip())
 
