@@ -27,7 +27,7 @@ class NHInvestClient:
                 pass
         self._issue_token()
 
-   def _issue_token(self):
+    def _issue_token(self):
         """나무증권 OAuth2 접근 토큰 신규 발급"""
         url = f"{self.BASE_URL}/oauth2/token"
         headers = {
@@ -39,7 +39,7 @@ class NHInvestClient:
             "grant_type": "client_credentials",
             "scope": "oob"
         }
-        
+
         try:
             res = requests.post(url, headers=headers, data=data, timeout=10)
             if res.status_code != 200:
@@ -64,14 +64,13 @@ class NHInvestClient:
     def get_current_price(self, ticker="069500"):
         """나무증권 현재가 체결추이 조회 (/krstock/quote/v1/currentExecution)"""
         url = f"{self.BASE_URL}/krstock/quote/v1/currentExecution"
-        
+
         for attempt in range(2):
             headers = {
                 "Content-Type": "application/json; charset=utf-8",
                 "Authorization": f"Bearer {self.access_token}",
                 "appkey": self.app_key,
-                "appsecretkey": self.app_secret,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
+                "appsecretkey": self.app_secret
             }
             payload = {
                 "Input_0": {
@@ -92,7 +91,7 @@ class NHInvestClient:
                 res.raise_for_status()
 
             data = res.json()
-            
+
             price = None
             if "Output_1" in data and isinstance(data["Output_1"], dict):
                 price = data["Output_1"].get("stck_prpr")
@@ -117,7 +116,6 @@ class NHInvestClient:
                 "Authorization": f"Bearer {self.access_token}",
                 "appkey": self.app_key,
                 "appsecretkey": self.app_secret,
-                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
                 "cts": "",
                 "cts_flag": "",
                 "mac_address": ""
