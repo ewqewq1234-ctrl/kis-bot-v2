@@ -28,7 +28,7 @@ class NHInvestClient:
         self._issue_token()
 
     def _issue_token(self):
-        """나무증권 OAuth2 접근 토큰 신규 발급"""
+        """나무증권 OAuth2 접근 토큰 신규 발급 (Content-Type 엄격 준수)"""
         url = f"{self.BASE_URL}/oauth2/token"
         headers = {
             "Content-Type": "application/x-www-form-urlencoded"
@@ -91,7 +91,6 @@ class NHInvestClient:
                 res.raise_for_status()
 
             data = res.json()
-
             price = None
             if "Output_1" in data and isinstance(data["Output_1"], dict):
                 price = data["Output_1"].get("stck_prpr")
@@ -105,8 +104,43 @@ class NHInvestClient:
 
         raise RuntimeError("토큰 재발급 후에도 시세 조회에 실패했습니다.")
 
+    def get_stock_balance(self, account_no, ticker="069500"):
+        """실제 계좌 보유 잔고 및 평균 매입단가 조회"""
+        url = f"{self.BASE_URL}/krstock/account/v1/balance"
+        headers = {
+            "Content-Type": "application/json; charset=utf-8",
+            "Authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "cts": "",
+            "cts_flag": ""
+        }
+        payload = {
+            "Input_0": {
+                "act_no": str(account_no).replace("-", "").strip(),
+                "inqr_cnd_dit_cd": "01"
+            }
+        }
+        try:
+            res = requests.post(url, headers=headers, json=payload, timeout=10)
+            if res.status_code != 200:
+                return None, None
+            
+            data = res.json()
+            output_list = data.get("Output_1") or data.get("output1") or []
+            for item in output_list:
+                iem_cd = item.get("iem_cd") or item.get("pdno") or ""
+                if str(ticker) in str(iem_cd):
+                    qty = int(item.get("hld_qty") or item.get("cblc_qty") or 0)
+                    avg_prc = float(item.get("pchs_avg_prc") or item.get("pchs_amt") or 0.0)
+                    return qty, avg_prc
+            return 0, 0.0
+        except Exception as e:
+            print(f"[잔고 동기화 조회 오류]: {e}")
+            return None, None
+
     def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
-        """나무증권 공식 매수/매도 주문 전송 (KRX 시장가 '05')"""
+        """나무증권 매수/매도 주문 전송 및 성공 응답 검증"""
         endpoint = "/krstock/order/v1/cashBuy" if order_type == "BUY" else "/krstock/order/v1/cashSell"
         url = f"{self.BASE_URL}{endpoint}"
 
@@ -139,15 +173,22 @@ class NHInvestClient:
                 }
             }
 
-            try:
-                res = requests.post(url, headers=headers, json=payload, timeout=10)
-                if "IGW40043" in res.text or res.status_code == 401:
-                    print("[주문 중 토큰 만료 감지] 토큰 재발급 후 재주문 시도...")
-                    self._issue_token()
-                    continue
+            res = requests.post(url, headers=headers, json=payload, timeout=10)
+            
+            if "IGW40043" in res.text or res.status_code == 401:
+                print("[주문 중 토큰 만료 감지] 토큰 재발급 후 재주문 시도...")
+                self._issue_token()
+                continue
 
-                print(f"[주문 API 결과] {order_type} {qty}주 | HTTP {res.status_code} | 본문: {res.text}")
-                return res.json()
-            except Exception as e:
-                print(f"[주문 전송 오류]: {e}")
-                return None
+            result = res.json()
+            rsp_cd = result.get("rsp_cd", "")
+            rsp_msg = result.get("rsp_msg", "")
+            
+            # 매수 접수(00048), 매도 접수(00047), 정상 접수(00000) 검증
+            if rsp_cd not in ["00048", "00047", "00000"]:
+                raise RuntimeError(f"증권사 주문 거절 [{rsp_cd}]: {rsp_msg}")
+
+            print(f"[주문 접수 성공] {order_type} {qty}주 | 응답: {rsp_msg}")
+            return result
+
+        raise RuntimeError("주문 재시도 후에도 주문 처리에 실패했습니다.")
