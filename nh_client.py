@@ -27,30 +27,40 @@ class NHInvestClient:
                 pass
         self._issue_token()
 
-    def _issue_token(self):
-        """나무증권 OAuth2 접근 토큰 신규 발급 (curl 동일 규격)"""
+def _issue_token(self):
+        """나무증권 OAuth2 접근 토큰 신규 발급 (WAF 차단 회피 헤더 적용)"""
         url = f"{self.BASE_URL}/oauth2/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded; charset=utf-8"}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded; charset=utf-8",
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+        }
         payload_str = (
             f"appkey={self.app_key}&"
             f"appsecretkey={self.app_secret}&"
             f"grant_type=client_credentials&"
             f"scope=oob"
         )
-        res = requests.post(url, headers=headers, data=payload_str, timeout=10)
-        res.raise_for_status()
-        token_info = res.json()
+        
+        try:
+            res = requests.post(url, headers=headers, data=payload_str, timeout=10)
+            if res.status_code != 200:
+                print(f"[토큰 발급 실패] HTTP {res.status_code} | 본문: {res.text}")
+                res.raise_for_status()
 
-        self.access_token = token_info["access_token"]
-        expires_in = token_info.get("expires_in", 86400)
-        expires_at = datetime.now() + timedelta(seconds=expires_in)
+            token_info = res.json()
+            self.access_token = token_info.get("access_token")
+            expires_in = token_info.get("expires_in", 86400)
+            expires_at = datetime.now() + timedelta(seconds=expires_in)
 
-        with open(self.token_file, "w", encoding="utf-8") as f:
-            json.dump({
-                "access_token": self.access_token,
-                "expires_at": expires_at.isoformat()
-            }, f, indent=2)
-        print("[토큰 발급 완료] 새로운 접근 토큰이 저장되었습니다.")
+            with open(self.token_file, "w", encoding="utf-8") as f:
+                json.dump({
+                    "access_token": self.access_token,
+                    "expires_at": expires_at.isoformat()
+                }, f, indent=2)
+            print("[토큰 발급 성공] 신규 토큰이 정상적으로 저장되었습니다.")
+        except Exception as e:
+            print(f"[토큰 발급 중 치명적 오류]: {e}")
+            raise
 
     def get_current_price(self, ticker="069500"):
         """나무증권 현재가 체결추이 조회 (/krstock/quote/v1/currentExecution)"""
