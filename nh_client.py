@@ -116,8 +116,8 @@ class NHInvestClient:
         raise RuntimeError("토큰 재발급 후에도 시세 조회 실패")
 
     def get_account_assets(self, account_no, ticker="069500"):
-        """실시간 예수금 및 대상 종목 보유 잔고/평단가 조회 (100% 자산 활용)"""
-        url = f"{self.BASE_URL}/krstock/account/v1/balance"
+        """실시간 예수금 및 대상 종목 보유 잔고/평단가 조회 (나무증권 공식 엔드포인트)"""
+        url = f"{self.BASE_URL}/krstock/inquiry/v1/balance"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {self.access_token}",
@@ -129,36 +129,39 @@ class NHInvestClient:
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
-                "inqr_cnd_dit_cd": "01"
+                "bnc_bse_cd": "1",      # 체결기준 잔고
+                "ltg_aot_dit_cd": "1",  # 상장종목
+                "aet_bse": "1",         # 순자산 기준
+                "qut_dit_cd": "UNT"     # 통합시세
             }
         }
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=10)
             if res.status_code != 200:
-                print(f"[계좌 자산 조회 실패] HTTP {res.status_code}")
+                print(f"[계좌 자산 조회 실패] HTTP {res.status_code} | 본문: {res.text}")
                 return None, 0, 0.0
 
             data = res.json()
             
-            # 예수금 / 출금가능금액 / 주문가능현금 추출
-            summary = data.get("Output_2") or data.get("output2") or {}
+            # 예수금 / 총평가금액 추출 (Output_0 요약)
+            summary = data.get("Output_0") or {}
             if isinstance(summary, list) and len(summary) > 0:
                 summary = summary[0]
 
             cash = float(
                 summary.get("ord_able_cash") or 
                 summary.get("dnca_tot_amt") or 
-                summary.get("nxdy_excc_amt") or 
+                summary.get("eal_amt_sum") or 
                 0.0
             )
 
-            # 보유 종목 추출
+            # 보유 종목 추출 (Output_1 목록)
             shares = 0
             avg_price = 0.0
-            stocks = data.get("Output_1") or data.get("output1") or []
+            stocks = data.get("Output_1") or []
             for item in stocks:
-                iem_cd = item.get("iem_cd") or item.get("pdno") or ""
-                if str(ticker) in str(iem_cd):
+                iem_cd = str(item.get("iem_cd") or item.get("pdno") or "")
+                if str(ticker) in iem_cd:
                     shares = int(item.get("hld_qty") or item.get("cblc_qty") or 0)
                     avg_price = float(item.get("pchs_avg_prc") or item.get("pchs_amt") or 0.0)
                     break
