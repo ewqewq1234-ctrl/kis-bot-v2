@@ -116,7 +116,7 @@ class NHInvestClient:
         raise RuntimeError("토큰 재발급 후에도 시세 조회 실패")
 
     def get_account_assets(self, account_no, ticker="069500"):
-        """실시간 예수금 및 대상 종목 보유 잔고/평단가 조회 (나무증권 공식 엔드포인트)"""
+        """실시간 예수금 및 대상 종목 보유 잔고/평단가 조회 (종목코드 A 접두사 및 필드 유연 대응)"""
         url = f"{self.BASE_URL}/krstock/inquiry/v1/balance"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
@@ -129,21 +129,21 @@ class NHInvestClient:
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
-                "bnc_bse_cd": "1",      # 체결기준 잔고
-                "ltg_aot_dit_cd": "1",  # 상장종목
-                "aet_bse": "1",         # 순자산 기준
-                "qut_dit_cd": "UNT"     # 통합시세
+                "bnc_bse_cd": "1",
+                "ltg_aot_dit_cd": "1",
+                "aet_bse": "1",
+                "qut_dit_cd": "UNT"
             }
         }
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=10)
             if res.status_code != 200:
-                print(f"[계좌 자산 조회 실패] HTTP {res.status_code} | 본문: {res.text}")
+                print(f"[계좌 자산 조회 실패] HTTP {res.status_code}")
                 return None, 0, 0.0
 
             data = res.json()
             
-            # 예수금 / 총평가금액 추출 (Output_0 요약)
+            # 예수금 추출
             summary = data.get("Output_0") or {}
             if isinstance(summary, list) and len(summary) > 0:
                 summary = summary[0]
@@ -155,14 +155,16 @@ class NHInvestClient:
                 0.0
             )
 
-            # 보유 종목 추출 (Output_1 목록)
+            # 보유 종목 추출 (A069500 또는 069500 모두 매칭)
             shares = 0
             avg_price = 0.0
+            clean_ticker = str(ticker).replace("A", "").strip()
             stocks = data.get("Output_1") or []
+            
             for item in stocks:
-                iem_cd = str(item.get("iem_cd") or item.get("pdno") or "")
-                if str(ticker) in iem_cd:
-                    shares = int(item.get("hld_qty") or item.get("cblc_qty") or 0)
+                raw_code = str(item.get("iem_cd") or item.get("pdno") or item.get("prdt_no") or "")
+                if clean_ticker in raw_code.replace("A", ""):
+                    shares = int(item.get("hld_qty") or item.get("cblc_qty") or item.get("ord_able_qty") or 0)
                     avg_price = float(item.get("pchs_avg_prc") or item.get("pchs_amt") or 0.0)
                     break
 
