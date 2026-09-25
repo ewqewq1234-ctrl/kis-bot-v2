@@ -100,6 +100,20 @@ def check_and_send_summary(state, client, price, now_kst):
         save_state(state)
         print(f"[{today_str} 일일 결산 브리핑 완료]")
 
+def is_twenty_business_days_passed(start_date_str, current_date):
+    """단순 주말 제외 기준 대략 20영업일 경과 여부 체크"""
+    try:
+        start_date = datetime.strptime(start_date_str, "%Y-%m-%d").date()
+        cur = start_date
+        business_days = 0
+        while cur < current_date:
+            cur += timedelta(days=1)
+            if cur.weekday() < 5:  # 월~금
+                business_days += 1
+        return business_days >= 20
+    except Exception:
+        return False
+
 def execute_strategy():
     kst = timezone(timedelta(hours=9))
     now_kst = datetime.now(kst)
@@ -111,24 +125,31 @@ def execute_strategy():
         account_no = os.getenv("NH_ACCOUNT_NO")
         price = client.get_current_price(TICKER)
 
-        # 1. 실제 계좌 예수금 및 잔고 실시간 동기화 (예치금 100% 활용)
+        # 1. 실제 계좌 예수금 및 잔고 실시간 동기화
         cash, real_qty, real_avg = client.get_account_assets(account_no, TICKER)
         if cash is not None:
-            # 총 운용 가능 자본 = 순수 예수금 + 현재 주식 평가금액
             total_equity = cash + (real_qty * price)
             if total_equity > 0:
                 state["total_capital"] = total_equity
-            
-            # 주식 잔고 동기화
+
+            # 잔고 불일치 보정
             if real_qty != state["shares"] or (real_qty > 0 and abs(state["avg_price"] - real_avg) > 1.0):
                 print(f"[자산 동기화] state({state['shares']}주 / {state['avg_price']}원) -> 실제({real_qty}주 / {real_avg}원) | 총자산: {total_equity:,.0f}원")
                 state["shares"] = real_qty
                 if real_avg > 0:
                     state["avg_price"] = real_avg
+                
+                # 보유 주식이 있는데 0단계로 되어 있는 경우 1단계로 보정보강
+                if real_qty > 0 and state["current_stage"] == 0 and not state["pyramid_mode"]:
+                    state["current_stage"] = 1
+                    if not state.get("first_buy_date"):
+                        state["first_buy_date"] = today_str
+                    if state.get("last_buy_price", 0.0) == 0.0:
+                        state["last_buy_price"] = real_avg
 
         total_capital = state["total_capital"]
 
-        # 예치금 100% 기준 단계별 예산 배분 (10% : 20% : 30% : 40%)
+        # 예치금 기준 단계별 예산 배분 (10% : 20% : 30% : 40%)
         stage_budgets = [
             total_capital * 0.10,
             total_capital * 0.20,
@@ -168,8 +189,8 @@ def execute_strategy():
                 check_and_send_summary(state, client, price, now_kst)
                 return
 
-        # 3. 0단계 신규 1단계 매수 진입
-        if state["current_stage"] == 0 and not state["pyramid_mode"]:
+        # 3. 0단계 신규 1단계 매수 진입 (보유 주식이 정확히 0일 때만)
+        if state["current_stage"] == 0 and state["shares"] == 0 and not state["pyramid_mode"]:
             qty = int(stage_budgets[0] // price)
             if qty == 0 and total_capital >= price:
                 qty = 1
@@ -260,10 +281,9 @@ def execute_strategy():
                 check_and_send_summary(state, client, price, now_kst)
                 return
 
-            # 규칙 ③: 4단계 풀매수 후 20영업일(달력 28일) 경과 시 본전(+0.2%) 탈출
+            # 규칙 ③: 4단계 풀매수 후 20영업일 경과 시 본전(+0.2%) 탈출
             if state["current_stage"] == 4 and state.get("first_buy_date"):
-                first_date = datetime.strptime(state["first_buy_date"], "%Y-%m-%d").date()
-                if (now_kst.date() - first_date).days >= 28:
+                if is_twenty_business_days_passed(state["first_buy_date"], now_kst.date()):
                     if price >= state["avg_price"] * (1 + BREAK_EVEN_RATE):
                         client.send_order(account_no, ticker=TICKER, qty=state["shares"], order_type="SELL")
                         realized_profit = int((price - state["avg_price"]) * state["shares"])
