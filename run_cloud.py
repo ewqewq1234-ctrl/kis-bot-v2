@@ -124,27 +124,42 @@ def execute_strategy():
         account_no = os.getenv("NH_ACCOUNT_NO")
         price = client.get_current_price(TICKER)
 
-        # 1. 실제 계좌 예수금 및 잔고 실시간 동기화
-        cash, real_qty, real_avg = client.get_account_assets(account_no, TICKER)
+        # 1. 실제 계좌 자산현황 실시간 동기화
+        cash, real_qty, real_avg, net_assets = client.get_account_assets(account_no, TICKER)
+        
         if cash is not None:
-            total_equity = cash + (real_qty * price)
-            if total_equity > 0:
-                state["total_capital"] = total_equity
+            # 순자산이 정상 조회되면 운용자본으로 활용, 아니면 예수금+평가금 합산
+            if net_assets > 0:
+                state["total_capital"] = net_assets
+            else:
+                total_equity = cash + (real_qty * price)
+                if total_equity > 0:
+                    state["total_capital"] = total_equity
 
-            # 잔고 보정
+            # 실제 잔고와 동기화 (오차 보정)
             if real_qty != state["shares"] or (real_qty > 0 and abs(state["avg_price"] - real_avg) > 1.0):
-                print(f"[자산 동기화] state({state['shares']}주/{state['avg_price']}원) -> 실제({real_qty}주/{real_avg}원) | 총자산: {total_equity:,.0f}원")
+                print(f"[자산 동기화] state({state['shares']}주/{state['avg_price']}원) -> 실제({real_qty}주/{real_avg}원) | 총자본: {state['total_capital']:,.0f}원")
                 state["shares"] = real_qty
                 if real_avg > 0:
                     state["avg_price"] = real_avg
 
-            # 보유 주식이 있는데 0단계로 되어 있는 비정상 상태 복구
+            # 실제 주식을 보유 중인데 0단계로 되어 있는 경우 최소 1단계로 보정
             if real_qty > 0 and state["current_stage"] == 0 and not state["pyramid_mode"]:
                 state["current_stage"] = 1
                 if not state.get("first_buy_date"):
                     state["first_buy_date"] = today_str
                 if state.get("last_buy_price", 0.0) == 0.0:
                     state["last_buy_price"] = real_avg or price
+                save_state(state)
+
+            # 실제 보유량이 0인데 단계가 남아 있는 경우 초기화
+            if real_qty == 0 and state["current_stage"] > 0 and not state["pyramid_mode"]:
+                print(f"[상태 정상화] 실제 보유량이 0주이므로 0단계로 리셋합니다.")
+                state.update({
+                    "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
+                    "current_stage": 0, "first_buy_date": ""
+                })
+                save_state(state)
 
         total_capital = state["total_capital"]
 
@@ -156,7 +171,7 @@ def execute_strategy():
             total_capital * 0.40
         ]
 
-        print(f"[{now_kst.strftime('%H:%M:%S')}] KODEX 200: {price:,.0f}원 | {state['current_stage']}단계 | 보유: {state['shares']}주 | 총자산: {total_capital:,.0f}원")
+        print(f"[{now_kst.strftime('%H:%M:%S')}] KODEX 200: {price:,.0f}원 | {state['current_stage']}단계 | 보유: {state['shares']}주 | 총자본: {total_capital:,.0f}원")
 
         # 2. 불타기 트레일링 스탑 모드
         if state["pyramid_mode"]:
@@ -197,7 +212,7 @@ def execute_strategy():
             if qty > 0:
                 client.send_order(account_no, ticker=TICKER, qty=qty, order_type="BUY")
                 time.sleep(2)
-                _, act_qty, act_avg = client.get_account_assets(account_no, TICKER)
+                _, act_qty, act_avg, _ = client.get_account_assets(account_no, TICKER)
 
                 state["shares"] = act_qty if (act_qty and act_qty > 0) else qty
                 state["avg_price"] = act_avg if (act_avg and act_avg > 0) else price
@@ -316,7 +331,7 @@ def execute_strategy():
                 if add_qty > 0:
                     client.send_order(account_no, ticker=TICKER, qty=add_qty, order_type="BUY")
                     time.sleep(2)
-                    _, act_qty, act_avg = client.get_account_assets(account_no, TICKER)
+                    _, act_qty, act_avg, _ = client.get_account_assets(account_no, TICKER)
 
                     total_shares = act_qty if (act_qty and act_qty > state["shares"]) else (state["shares"] + add_qty)
                     new_avg = act_avg if (act_avg and act_avg > 0) else (((state["shares"] * state["avg_price"]) + (add_qty * price)) / total_shares)
