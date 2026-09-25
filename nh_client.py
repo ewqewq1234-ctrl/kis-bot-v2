@@ -1,4 +1,4 @@
-import os
+import osimport os
 import json
 import requests
 from datetime import datetime, timezone, timedelta
@@ -26,7 +26,6 @@ class NHInvestClient:
                     expires_at_str = data.get("expires_at", "2000-01-01T00:00:00")
                     expires_at = datetime.fromisoformat(expires_at_str)
 
-                    # 당일 발급되었고 만료 30분 전까지는 저장된 토큰 재사용
                     if issued_date == today_str and datetime.now() < expires_at - timedelta(minutes=30):
                         self.access_token = data.get("access_token")
                         return
@@ -116,8 +115,10 @@ class NHInvestClient:
         raise RuntimeError("토큰 재발급 후에도 시세 조회 실패")
 
     def get_account_assets(self, account_no, ticker="069500"):
-        """실시간 예수금 및 대상 종목 보유 잔고/평단가 조회 (종목코드 A 접두사 및 필드 유연 대응)"""
-        url = f"{self.BASE_URL}/krstock/inquiry/v1/balance"
+        """국내주식 자산현황 조회 (/krstock/inquiry/v1/assetStatus)
+        반환: (예수금/주문가능금액, 대상종목보유수량, 매입평단가, 순자산총액)
+        """
+        url = f"{self.BASE_URL}/krstock/inquiry/v1/assetStatus"
         headers = {
             "Content-Type": "application/json; charset=utf-8",
             "Authorization": f"Bearer {self.access_token}",
@@ -129,49 +130,42 @@ class NHInvestClient:
         payload = {
             "Input_0": {
                 "act_no": str(account_no).replace("-", "").strip(),
-                "bnc_bse_cd": "1",
-                "ltg_aot_dit_cd": "1",
-                "aet_bse": "1",
-                "qut_dit_cd": "UNT"
+                "eal_aly_cd": "2",   # 시가평가
+                "aet_bse": "1",      # 순자산
+                "qut_dit_cd": "UNT",  # 통합시세
+                "aly_qut_cd": "2"    # 전체장
             }
         }
         try:
             res = requests.post(url, headers=headers, json=payload, timeout=10)
             if res.status_code != 200:
-                print(f"[계좌 자산 조회 실패] HTTP {res.status_code}")
-                return None, 0, 0.0
+                print(f"[계좌 자산 조회 실패] HTTP {res.status_code} | 본문: {res.text}")
+                return None, 0, 0.0, 0.0
 
             data = res.json()
+            out_0 = data.get("Output_0") or {}
             
-            # 예수금 추출
-            summary = data.get("Output_0") or {}
-            if isinstance(summary, list) and len(summary) > 0:
-                summary = summary[0]
+            # 예수금 및 순자산총액
+            cash = float(out_0.get("stk_orr_pbl_amt") or out_0.get("dca") or 0.0)
+            net_assets = float(out_0.get("nas_amt") or out_0.get("tot_aet_amt") or 0.0)
 
-            cash = float(
-                summary.get("ord_able_cash") or 
-                summary.get("dnca_tot_amt") or 
-                summary.get("eal_amt_sum") or 
-                0.0
-            )
-
-            # 보유 종목 추출 (A069500 또는 069500 모두 매칭)
+            # 대상 종목 보유수량 및 매입평단가
             shares = 0
             avg_price = 0.0
             clean_ticker = str(ticker).replace("A", "").strip()
-            stocks = data.get("Output_1") or []
-            
-            for item in stocks:
-                raw_code = str(item.get("iem_cd") or item.get("pdno") or item.get("prdt_no") or "")
-                if clean_ticker in raw_code.replace("A", ""):
-                    shares = int(item.get("hld_qty") or item.get("cblc_qty") or item.get("ord_able_qty") or 0)
-                    avg_price = float(item.get("pchs_avg_prc") or item.get("pchs_amt") or 0.0)
-                    break
+            stock_list = data.get("Output_1") or []
 
-            return cash, shares, avg_price
+            for item in stock_list:
+                item_cd = str(item.get("iem_cd") or "").replace("A", "").strip()
+                if clean_ticker == item_cd:
+                    shares += int(float(item.get("itg_bnc_qty") or 0))
+                    # 복수 레코드 존재 시 가중 평균 또는 대표 단가
+                    avg_price = float(item.get("phs_pr") or 0.0)
+
+            return cash, shares, avg_price, net_assets
         except Exception as e:
-            print(f"[계좌 자산 조회 오류]: {e}")
-            return None, 0, 0.0
+            print(f"[계좌 자산 조회 예외]: {e}")
+            return None, 0, 0.0, 0.0
 
     def send_order(self, account_no, ticker="069500", qty=1, price=0, order_type="BUY"):
         """나무증권 공식 매수/매도 주문 전송 (KRX 시장가 '05') 및 검증"""
@@ -218,7 +212,6 @@ class NHInvestClient:
             rsp_cd = result.get("rsp_cd", "")
             rsp_msg = result.get("rsp_msg", "")
 
-            # 정상 접수 코드: 00048(매수), 00047(매도), 00000(성공)
             if rsp_cd not in ["00048", "00047", "00000"]:
                 raise RuntimeError(f"증권사 주문 거절 [{rsp_cd}]: {rsp_msg}")
 
