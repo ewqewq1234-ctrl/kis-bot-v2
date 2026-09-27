@@ -82,7 +82,6 @@ def check_and_send_summary(state, client, price, now_kst):
         eval_profit = (price - avg_price) * shares if shares > 0 else 0
         profit_rate = ((price / avg_price) - 1) * 100 if (shares > 0 and avg_price > 0) else 0.0
         
-        # 단계별 목표가 표시
         stage = state.get("current_stage", 0)
         if stage in [1, 2]:
             target_desc = f"+2.0% 감시가 ({avg_price * (1 + STAGE_1_2_TARGET):,.0f}원)"
@@ -130,9 +129,7 @@ def execute_strategy():
         account_no = os.getenv("NH_ACCOUNT_NO")
         price = client.get_current_price(TICKER)
 
-        # ---------------------------------------------------------------------
-        # 1. 증권사 실제 계좌 자산현황 실시간 동기화 (GitHub 지연 방어)
-        # ---------------------------------------------------------------------
+        # 1. 증권사 실제 계좌 자산현황 실시간 동기화
         cash, real_qty, real_avg, net_assets = client.get_account_assets(account_no, TICKER)
         if cash is not None:
             if net_assets > 0:
@@ -176,9 +173,7 @@ def execute_strategy():
 
         print(f"[{now_kst.strftime('%H:%M:%S')}] KODEX 200: {price:,.0f}원 | {state['current_stage']}단계 | 보유: {state['shares']}주 | 총자산: {total_capital:,.0f}원")
 
-        # ---------------------------------------------------------------------
         # 2. 1~2단계 트레일링 스탑 감시 및 청산
-        # ---------------------------------------------------------------------
         if state["trailing_mode"] and state["shares"] > 0:
             if price > state["highest_price"]:
                 state["highest_price"] = price
@@ -205,9 +200,7 @@ def execute_strategy():
                 check_and_send_summary(state, client, price, now_kst)
                 return
 
-        # ---------------------------------------------------------------------
         # 3. 0단계 신규 진입 (1단계 10% 매수)
-        # ---------------------------------------------------------------------
         if state["current_stage"] == 0 and state["shares"] == 0:
             qty = int(stage_budgets[0] // price)
             if qty == 0 and total_capital >= price:
@@ -235,9 +228,7 @@ def execute_strategy():
             check_and_send_summary(state, client, price, now_kst)
             return
 
-        # ---------------------------------------------------------------------
         # 4. 보유 중 포지션 관리 및 청산 매트릭스
-        # ---------------------------------------------------------------------
         if state["shares"] > 0:
             gain_rate = (price / state["avg_price"]) - 1.0
 
@@ -300,4 +291,28 @@ def execute_strategy():
                     state["avg_price"] = new_avg
                     state["last_buy_price"] = price
                     state["current_stage"] = next_stage
-                    state["trailing_mode"] =
+                    state["trailing_mode"] = False  # 물타기 진행 시 트레일링 모드 리셋
+                    save_state(state)
+
+                    stage_desc = "최종 풀베팅" if next_stage == 4 else f"{next_stage}차 추가매수"
+                    msg = (
+                        f"🔵 <b>[전략 B {next_stage}단계 ({stage_desc}) 체결]</b>\n"
+                        f"• 추가 매수: {add_qty}주 (예산 {budget:,.0f}원)\n"
+                        f"• 누적 보유: {total_shares}주\n"
+                        f"• 밀착 평단: {new_avg:,.0f}원 (직전 대비 {dip_rate * 100:+.2f}%)\n"
+                        f"• 다음 청산 목표: {'+0.05% 본전 탈출' if next_stage >= 3 else '+2.0% 트레일링'}"
+                    )
+                    send_telegram_message(msg)
+
+        # 5. 장마감 결산 체크 및 최종 상태 저장
+        check_and_send_summary(state, client, price, now_kst)
+        save_state(state)
+
+    except Exception as e:
+        err_msg = str(e)
+        print(f"[전략 실행 오류]: {err_msg}")
+        send_telegram_alert(err_msg)
+        raise
+
+if __name__ == "__main__":
+    execute_strategy()
