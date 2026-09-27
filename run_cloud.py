@@ -8,11 +8,11 @@ from nh_client import NHInvestClient
 STATE_FILE = "state.json"
 TICKER = "069500"  # KODEX 200
 
-# 리스크 관리 방어 파라미터
-DIP_INTERVAL = -0.028      # 물타기 간격: 직전 매수가 대비 -2.8%
-HARD_STOP_LOSS = -0.050    # 4단계 확정 하방 손절선: 평단가 대비 -5.0%
-TAKE_PROFIT = 0.020        # 목표 익절선: 평단가 대비 +2.0% (90% 분할 매도)
-BREAK_EVEN_RATE = 0.002    # 20영업일 경과 본전 탈출선: +0.2%
+# 전략 B 확정 파라미터
+DIP_INTERVAL = -0.028          # 추가 매수(물타기) 간격: 직전 매수가 대비 -2.8%
+STAGE_1_2_TARGET = 0.020       # 1~2단계 목표 익절선: 평단가 대비 +2.0%
+TRAILING_STOP_DROP = 0.010     # 트레일링 스탑 낙폭: 최고가 대비 -1.0% 하락 시 청산
+BREAK_EVEN_TARGET = 0.0005     # 3~4단계 비상 본전 탈출선: 평단가 대비 +0.05% (제비용 보전)
 
 def load_state():
     default_state = {
@@ -23,11 +23,11 @@ def load_state():
         "avg_price": 0.0,
         "last_buy_price": 0.0,
         "first_buy_date": "",
-        "pyramid_mode": False,
-        "pyramid_shares": 0,
+        "trailing_mode": False,
         "highest_price": 0.0,
         "total_profit_accumulated": 0,
         "cycle_win_count": 0,
+        "cycle_draw_count": 0,
         "last_summary_date": ""
     }
     if os.path.exists(STATE_FILE):
@@ -64,15 +64,15 @@ def send_telegram_message(text):
 def send_telegram_alert(error_msg):
     kst = timezone(timedelta(hours=9))
     text = (
-        f"🚨 <b>[ETF 그리드봇 비상 경보]</b>\n"
+        f"🚨 <b>[전략 B 비상 경보]</b>\n"
         f"• 시각: {datetime.now(kst).strftime('%Y-%m-%d %H:%M:%S')}\n"
-        f"• 내용: <code>{error_msg}</code>\n"
-        f"• 계좌 상태를 수동으로 확인해 주세요."
+        f"• 에러: <code>{error_msg}</code>\n"
+        f"• 확인 후 조치 바랍니다."
     )
     send_telegram_message(text)
 
 def check_and_send_summary(state, client, price, now_kst):
-    """한국 시간 15시 이후 일일 결산 브리핑 (1일 1회)"""
+    """15시 이후 장마감 일일 브리핑 (1일 1회)"""
     today_str = now_kst.strftime("%Y-%m-%d")
     if now_kst.hour >= 15 and state.get("last_summary_date") != today_str:
         shares = state.get("shares", 0)
@@ -81,37 +81,43 @@ def check_and_send_summary(state, client, price, now_kst):
 
         eval_profit = (price - avg_price) * shares if shares > 0 else 0
         profit_rate = ((price / avg_price) - 1) * 100 if (shares > 0 and avg_price > 0) else 0.0
-        target_price = avg_price * (1 + TAKE_PROFIT) if avg_price > 0 else 0.0
+        
+        # 단계별 목표가 표시
+        stage = state.get("current_stage", 0)
+        if stage in [1, 2]:
+            target_desc = f"+2.0% 감시가 ({avg_price * (1 + STAGE_1_2_TARGET):,.0f}원)"
+        elif stage in [3, 4]:
+            target_desc = f"+0.05% 본전탈출가 ({avg_price * (1 + BREAK_EVEN_TARGET):,.0f}원)"
+        else:
+            target_desc = "진입 대기"
 
         msg = (
-            f"📊 <b>[ETF 그리드봇 일일 결산 브리핑]</b>\n"
-            f"• 기준 일자: {today_str}\n"
+            f"📊 <b>[전략 B 일일 결산 브리핑]</b>\n"
+            f"• 일자: {today_str}\n"
             f"• KODEX 200: {price:,.0f}원\n"
-            f"• 현재 포지션: {state['current_stage']}단계 ({shares}주 보유)\n"
-            f"• 보유 평단가: {avg_price:,.0f}원\n"
+            f"• 포지션: {stage}단계 ({shares}주)\n"
+            f"• 매입 평단: {avg_price:,.0f}원\n"
             f"• 평가 손익: {eval_profit:+,.0f}원 ({profit_rate:+.2f}%)\n"
-            f"• 총 운용자산: {total_capital:,.0f}원\n"
+            f"• 운용 자본: {total_capital:,.0f}원\n"
             f"• 누적 실현손익: {state.get('total_profit_accumulated', 0):+,.0f}원\n"
-            f"• 목표 익절가(+2%): {target_price:,.0f}원\n"
-            f"• 물타기 기준(-2.8%): {state['last_buy_price'] * (1 + DIP_INTERVAL):,.0f}원"
+            f"• 전적: {state.get('cycle_win_count', 0)}승 {state.get('cycle_draw_count', 0)}무\n"
+            f"• 목표 청산선: {target_desc}"
         )
         state["last_summary_date"] = today_str
         save_state(state)
         send_telegram_message(msg)
-        print(f"[{today_str} 일일 결산 브리핑 완료]")
 
-def is_twenty_business_days_passed(start_date_str, current_date):
-    """월~금 평일 기준 20영업일 경과 판별"""
-    try:
-        cur = datetime.strptime(start_date_str, "%Y-%m-%d").date()
-        business_days = 0
-        while cur < current_date:
-            cur += timedelta(days=1)
-            if cur.weekday() < 5:
-                business_days += 1
-        return business_days >= 20
-    except Exception:
-        return False
+def reset_position(state):
+    """사이클 종료 시 상태 초기화 공통 함수"""
+    state.update({
+        "shares": 0,
+        "avg_price": 0.0,
+        "last_buy_price": 0.0,
+        "current_stage": 0,
+        "first_buy_date": "",
+        "trailing_mode": False,
+        "highest_price": 0.0
+    })
 
 def execute_strategy():
     kst = timezone(timedelta(hours=9))
@@ -124,11 +130,11 @@ def execute_strategy():
         account_no = os.getenv("NH_ACCOUNT_NO")
         price = client.get_current_price(TICKER)
 
-        # 1. 실제 계좌 자산현황 실시간 동기화
+        # ---------------------------------------------------------------------
+        # 1. 증권사 실제 계좌 자산현황 실시간 동기화 (GitHub 지연 방어)
+        # ---------------------------------------------------------------------
         cash, real_qty, real_avg, net_assets = client.get_account_assets(account_no, TICKER)
-        
         if cash is not None:
-            # 순자산이 정상 조회되면 운용자본으로 활용, 아니면 예수금+평가금 합산
             if net_assets > 0:
                 state["total_capital"] = net_assets
             else:
@@ -136,15 +142,15 @@ def execute_strategy():
                 if total_equity > 0:
                     state["total_capital"] = total_equity
 
-            # 실제 잔고와 동기화 (오차 보정)
+            # 실제 잔고 수량과 평단가 동기화
             if real_qty != state["shares"] or (real_qty > 0 and abs(state["avg_price"] - real_avg) > 1.0):
-                print(f"[자산 동기화] state({state['shares']}주/{state['avg_price']}원) -> 실제({real_qty}주/{real_avg}원) | 총자본: {state['total_capital']:,.0f}원")
+                print(f"[자산 동기화] state({state['shares']}주/{state['avg_price']}원) -> 계좌실제({real_qty}주/{real_avg}원)")
                 state["shares"] = real_qty
                 if real_avg > 0:
                     state["avg_price"] = real_avg
 
-            # 실제 주식을 보유 중인데 0단계로 되어 있는 경우 최소 1단계로 보정
-            if real_qty > 0 and state["current_stage"] == 0 and not state["pyramid_mode"]:
+            # 실제 보유 중인데 봇 내부 단계가 0이면 1단계로 안전 보정
+            if real_qty > 0 and state["current_stage"] == 0:
                 state["current_stage"] = 1
                 if not state.get("first_buy_date"):
                     state["first_buy_date"] = today_str
@@ -152,18 +158,15 @@ def execute_strategy():
                     state["last_buy_price"] = real_avg or price
                 save_state(state)
 
-            # 실제 보유량이 0인데 단계가 남아 있는 경우 초기화
-            if real_qty == 0 and state["current_stage"] > 0 and not state["pyramid_mode"]:
-                print(f"[상태 정상화] 실제 보유량이 0주이므로 0단계로 리셋합니다.")
-                state.update({
-                    "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
-                    "current_stage": 0, "first_buy_date": ""
-                })
+            # 실제 잔고가 0인데 단계가 남아있는 경우 리셋
+            if real_qty == 0 and state["current_stage"] > 0:
+                print(f"[상태 정상화] 실제 잔고 0주 확인 -> 포지션 리셋")
+                reset_position(state)
                 save_state(state)
 
         total_capital = state["total_capital"]
 
-        # 예치금 기준 단계별 예산 배분 (10% : 20% : 30% : 40%)
+        # 4단계 가중 분할 예산 배분 (10% : 20% : 30% : 40%)
         stage_budgets = [
             total_capital * 0.10,
             total_capital * 0.20,
@@ -171,40 +174,41 @@ def execute_strategy():
             total_capital * 0.40
         ]
 
-        print(f"[{now_kst.strftime('%H:%M:%S')}] KODEX 200: {price:,.0f}원 | {state['current_stage']}단계 | 보유: {state['shares']}주 | 총자본: {total_capital:,.0f}원")
+        print(f"[{now_kst.strftime('%H:%M:%S')}] KODEX 200: {price:,.0f}원 | {state['current_stage']}단계 | 보유: {state['shares']}주 | 총자산: {total_capital:,.0f}원")
 
-        # 2. 불타기 트레일링 스탑 모드
-        if state["pyramid_mode"]:
+        # ---------------------------------------------------------------------
+        # 2. 1~2단계 트레일링 스탑 감시 및 청산
+        # ---------------------------------------------------------------------
+        if state["trailing_mode"] and state["shares"] > 0:
             if price > state["highest_price"]:
                 state["highest_price"] = price
 
-            if price <= state["highest_price"] * 0.99:
-                sell_qty = state["pyramid_shares"]
+            # 당일 최고가 대비 -1.0% 하락 시 전량 이익 실현
+            if price <= state["highest_price"] * (1 - TRAILING_STOP_DROP):
+                sell_qty = state["shares"]
                 client.send_order(account_no, ticker=TICKER, qty=sell_qty, order_type="SELL")
 
                 realized_profit = int((price - state["avg_price"]) * sell_qty)
                 state["total_profit_accumulated"] += realized_profit
-
-                state.update({
-                    "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
-                    "current_stage": 0, "first_buy_date": "",
-                    "pyramid_mode": False, "pyramid_shares": 0, "highest_price": 0.0
-                })
                 state["cycle_win_count"] += 1
+                reset_position(state)
                 save_state(state)
 
                 msg = (
-                    f"🔥 <b>[불타기 트레일링 청산 완료]</b>\n"
-                    f"• 매도가: {price:,.0f}원 ({sell_qty}주)\n"
-                    f"• 확정 이익: {realized_profit:+,.0f}원\n"
-                    f"• 총 운용자본: {state['total_capital']:,.0f}원"
+                    f"🎉 <b>[1~2단계 트레일링 스탑 익절 완료]</b>\n"
+                    f"• 청산가: {price:,.0f}원 ({sell_qty}주 전량 매도)\n"
+                    f"• 최고 도달가: {state['highest_price']:,.0f}원\n"
+                    f"• 실현 이익: {realized_profit:+,.0f}원\n"
+                    f"• 누적 전적: {state['cycle_win_count']}승 {state['cycle_draw_count']}무"
                 )
                 send_telegram_message(msg)
                 check_and_send_summary(state, client, price, now_kst)
                 return
 
-        # 3. 0단계 신규 1단계 매수 진입 (보유 주식 0일 때만)
-        if state["current_stage"] == 0 and state["shares"] == 0 and not state["pyramid_mode"]:
+        # ---------------------------------------------------------------------
+        # 3. 0단계 신규 진입 (1단계 10% 매수)
+        # ---------------------------------------------------------------------
+        if state["current_stage"] == 0 and state["shares"] == 0:
             qty = int(stage_budgets[0] // price)
             if qty == 0 and total_capital >= price:
                 qty = 1
@@ -222,103 +226,59 @@ def execute_strategy():
                 save_state(state)
 
                 msg = (
-                    f"🟢 <b>[1단계 신규 매수 진입]</b>\n"
-                    f"• 투입 예산: {stage_budgets[0]:,.0f}원 (10%)\n"
-                    f"• 매수가: {price:,.0f}원 ({state['shares']}주)\n"
-                    f"• 총 운용자본: {total_capital:,.0f}원"
+                    f"🟢 <b>[전략 B 1단계 신규 매수 진입]</b>\n"
+                    f"• 배정 예산: {stage_budgets[0]:,.0f}원 (10%)\n"
+                    f"• 체결가: {price:,.0f}원 ({state['shares']}주)\n"
+                    f"• 운용 자본: {total_capital:,.0f}원"
                 )
                 send_telegram_message(msg)
             check_and_send_summary(state, client, price, now_kst)
             return
 
-        # 4. 보유 중 포지션 관리
+        # ---------------------------------------------------------------------
+        # 4. 보유 중 포지션 관리 및 청산 매트릭스
+        # ---------------------------------------------------------------------
         if state["shares"] > 0:
             gain_rate = (price / state["avg_price"]) - 1.0
 
-            # 규칙 ①: 4단계 확정 하방 손절 (-5.0% 도달 시)
-            if state["current_stage"] == 4 and gain_rate <= HARD_STOP_LOSS:
-                client.send_order(account_no, ticker=TICKER, qty=state["shares"], order_type="SELL")
-                realized_loss = int((price - state["avg_price"]) * state["shares"])
-                state["total_profit_accumulated"] += realized_loss
-
-                state.update({
-                    "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
-                    "current_stage": 0, "first_buy_date": "",
-                    "pyramid_mode": False, "pyramid_shares": 0, "highest_price": 0.0
-                })
-                save_state(state)
-
-                msg = (
-                    f"🛑 <b>[비상 4단계 확정 손절 집행]</b>\n"
-                    f"• 손절가: {price:,.0f}원 ({state['shares']}주 전량)\n"
-                    f"• 손실률: {gain_rate * 100:.2f}%\n"
-                    f"• 실현손실: {realized_loss:,}원\n"
-                    f"• 전액 현금화 후 포지션을 리셋합니다."
-                )
-                send_telegram_message(msg)
-                check_and_send_summary(state, client, price, now_kst)
-                return
-
-            # 규칙 ②: 목표 수익률 +2.0% 도달 시 90% 분할 익절
-            if gain_rate >= TAKE_PROFIT:
-                sell_qty = int(state["shares"] * 0.9)
-                if sell_qty == 0:
-                    sell_qty = state["shares"]
-                rem_qty = state["shares"] - sell_qty
-
-                client.send_order(account_no, ticker=TICKER, qty=sell_qty, order_type="SELL")
-                realized_profit = int((price - state["avg_price"]) * sell_qty)
-                state["total_profit_accumulated"] += realized_profit
-
-                if rem_qty > 0:
-                    state["pyramid_mode"] = True
-                    state["pyramid_shares"] = rem_qty
+            # [청산 매트릭스 ①] 1~2단계 보유 중일 때: +2.0% 터치 시 트레일링 스탑 가동
+            if state["current_stage"] in [1, 2]:
+                if not state["trailing_mode"] and gain_rate >= STAGE_1_2_TARGET:
+                    state["trailing_mode"] = True
                     state["highest_price"] = price
-                    state["shares"] = rem_qty
-                    state["current_stage"] = 0
-                else:
-                    state.update({
-                        "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
-                        "current_stage": 0, "first_buy_date": ""
-                    })
-                    state["cycle_win_count"] += 1
+                    save_state(state)
 
-                save_state(state)
+                    msg = (
+                        f"🎯 <b>[1~2단계 익절 목표(+2.0%) 도달 ➔ 트레일링 스탑 가동]</b>\n"
+                        f"• 현재가: {price:,.0f}원 (수익률: {gain_rate * 100:+.2f}%)\n"
+                        f"• 최고가 대비 -1.0% 하락 시 전량 이익 실현 대기"
+                    )
+                    send_telegram_message(msg)
 
-                msg = (
-                    f"🎯 <b>[목표수익 도달 익절 (90%)]</b>\n"
-                    f"• 익절가: {price:,.0f}원 (수익률: {gain_rate * 100:+.2f}%)\n"
-                    f"• 매도 수량: {sell_qty}주 (실현손익: {realized_profit:+,.0f}원)\n"
-                    f"• 잔여 불타기 물량: {rem_qty}주"
-                )
-                send_telegram_message(msg)
-                check_and_send_summary(state, client, price, now_kst)
-                return
+            # [청산 매트릭스 ②] 3~4단계 진입 시: +0.05% 도달 시 즉시 전량 본전 탈출
+            elif state["current_stage"] in [3, 4]:
+                if gain_rate >= BREAK_EVEN_TARGET:
+                    sell_qty = state["shares"]
+                    client.send_order(account_no, ticker=TICKER, qty=sell_qty, order_type="SELL")
 
-            # 규칙 ③: 4단계 풀매수 후 20영업일 경과 시 본전(+0.2%) 탈출
-            if state["current_stage"] == 4 and state.get("first_buy_date"):
-                if is_twenty_business_days_passed(state["first_buy_date"], now_kst.date()):
-                    if price >= state["avg_price"] * (1 + BREAK_EVEN_RATE):
-                        client.send_order(account_no, ticker=TICKER, qty=state["shares"], order_type="SELL")
-                        realized_profit = int((price - state["avg_price"]) * state["shares"])
-                        state["total_profit_accumulated"] += realized_profit
+                    realized_profit = int((price - state["avg_price"]) * sell_qty)
+                    state["total_profit_accumulated"] += realized_profit
+                    state["cycle_draw_count"] += 1
+                    reset_position(state)
+                    save_state(state)
 
-                        state.update({
-                            "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
-                            "current_stage": 0, "first_buy_date": ""
-                        })
-                        save_state(state)
+                    msg = (
+                        f"🛡️ <b>[3~4단계 위기 회피: 수수료 제외 본전 탈출 완료]</b>\n"
+                        f"• 청산가: {price:,.0f}원 ({sell_qty}주 전량)\n"
+                        f"• 수익률: {gain_rate * 100:+.2f}%\n"
+                        f"• 손익: {realized_profit:+,.0f}원 (원금 100% 보존)\n"
+                        f"• 누적 전적: {state['cycle_win_count']}승 {state['cycle_draw_count']}무 0패"
+                    )
+                    send_telegram_message(msg)
+                    check_and_send_summary(state, client, price, now_kst)
+                    return
 
-                        msg = (
-                            f"🛡️ <b>[20영업일 경과 본전 탈출 청산]</b>\n"
-                            f"• 탈출가: {price:,.0f}원 ({state['shares']}주 전량)\n"
-                            f"• 실현손익: {realized_profit:+,.0f}원"
-                        )
-                        send_telegram_message(msg)
-                        check_and_send_summary(state, client, price, now_kst)
-                        return
-
-            # 규칙 ④: 직전 매수가 대비 -2.8% 하락 시 단계별 물타기 매수
+            # [추가 매수(물타기)] 직전 매수가 대비 -2.8% 하락 시 다음 단계 가중 매수
             dip_rate = (price / state["last_buy_price"]) - 1.0
             next_stage = state["current_stage"] + 1
 
@@ -340,26 +300,4 @@ def execute_strategy():
                     state["avg_price"] = new_avg
                     state["last_buy_price"] = price
                     state["current_stage"] = next_stage
-                    save_state(state)
-
-                    msg = (
-                        f"🔵 <b>[{next_stage}단계 물타기 체결]</b>\n"
-                        f"• 투입 예산: {budget:,.0f}원 (누적 {total_shares}주)\n"
-                        f"• 신규 평단가: {new_avg:,.0f}원 (직전 대비 {dip_rate * 100:+.2f}%)\n"
-                        f"• 목표 익절가(+2%): {new_avg * (1 + TAKE_PROFIT):,.0f}원\n"
-                        f"• 다음 물타기선(-2.8%): {price * (1 + DIP_INTERVAL):,.0f}원"
-                    )
-                    send_telegram_message(msg)
-
-        # 5. 장마감 결산 체크
-        check_and_send_summary(state, client, price, now_kst)
-        save_state(state)
-
-    except Exception as e:
-        err_msg = str(e)
-        print(f"[실행 오류]: {err_msg}")
-        send_telegram_alert(err_msg)
-        raise
-
-if __name__ == "__main__":
-    execute_strategy()
+                    state["trailing_mode"] =
