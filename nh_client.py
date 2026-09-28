@@ -86,7 +86,7 @@ class NHInvestClient:
             print(f"[토큰 발급 중 치명적 오류]: {e}")
             raise
 
-    def get_current_price(self, ticker="069500"):
+   def get_current_price(self, ticker="069500"):
         """나무증권 현재가 체결추이 조회 (/krstock/quote/v1/currentExecution)"""
         url = f"{self.BASE_URL}/krstock/quote/v1/currentExecution"
 
@@ -104,8 +104,18 @@ class NHInvestClient:
                     "view_main_yn": "N"
                 }
             }
-            # timeout을 5 -> 10으로 상향하고 세션 통신 적용
-            res = self.session.post(url, headers=headers, json=payload, timeout=10)
+            
+            try:
+                # connect 10초, read 20초 분리 지정
+                res = self.session.post(url, headers=headers, json=payload, timeout=(10, 20))
+            except Exception as e:
+                print(f"[네트워크 연결 지연/차단]: {e}")
+                if attempt == 0:
+                    import time
+                    time.sleep(2)
+                    continue
+                return None
+
             if "IGW40043" in res.text or res.status_code == 401:
                 print("[토큰 만료 감지] 토큰 강제 재발급 진행...")
                 self._issue_token()
@@ -113,7 +123,7 @@ class NHInvestClient:
 
             if res.status_code != 200:
                 print(f"[시세 조회 실패] HTTP {res.status_code}: {res.text}")
-                res.raise_for_status()
+                return None
 
             data = res.json()
             price = None
@@ -123,11 +133,12 @@ class NHInvestClient:
                 price = data["Output_0"][0].get("stck_prpr")
 
             if price is None:
-                raise KeyError(f"현재가(stck_prpr) 파싱 불가: {res.text}")
+                print(f"[현재가 파싱 불가]: {res.text}")
+                return None
 
             return float(str(price).replace(",", "").strip())
 
-        raise RuntimeError("토큰 재발급 후에도 시세 조회 실패")
+        return None
 
     def get_account_assets(self, account_no, ticker="069500"):
         """국내주식 자산현황 조회 (/krstock/inquiry/v1/assetStatus)
