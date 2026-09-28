@@ -105,4 +105,4 @@ class NHInvestClient:
                 }
             }
             # timeout을 5 -> 10으로 상향하고 세션 통신 적용
-            res =
+            res = self.session.post(url, headers=headers, json=payload, timeout=10)
