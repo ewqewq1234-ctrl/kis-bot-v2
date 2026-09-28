@@ -86,7 +86,7 @@ class NHInvestClient:
             print(f"[토큰 발급 중 치명적 오류]: {e}")
             raise
 
-   def get_current_price(self, ticker="069500"):
+    def get_current_price(self, ticker="069500"):
         """나무증권 현재가 체결추이 조회 (/krstock/quote/v1/currentExecution)"""
         url = f"{self.BASE_URL}/krstock/quote/v1/currentExecution"
 
