@@ -129,6 +129,11 @@ def execute_strategy():
         account_no = os.getenv("NH_ACCOUNT_NO")
         price = client.get_current_price(TICKER)
 
+        # [안전 장치 추가] 시세 미수신(장마감/통신지연) 시 에러 종료 방지
+        if price is None or price <= 0:
+            print("[알림] 증권사 API 통신 지연 또는 장 마감 세션으로 현재가를 조회하지 못했습니다. 루틴을 건너뜁니다.")
+            return
+
         # 1. 증권사 실제 계좌 자산현황 실시간 동기화
         cash, real_qty, real_avg, net_assets = client.get_account_assets(account_no, TICKER)
         if cash is not None:
