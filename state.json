@@ -1,6 +1,6 @@
 {
   "initial_seed": 3000000,
-  "total_capital": 2998584.0,
+  "total_capital": 3000364.0,
   "current_stage": 2,
   "shares": 10,
   "avg_price": 111467.0,
@@ -11,7 +11,7 @@
   "total_profit_accumulated": 0,
   "cycle_win_count": 0,
   "cycle_draw_count": 0,
-  "last_summary_date": "2026-09-30",
+  "last_summary_date": "2026-10-01",
   "pyramid_mode": false,
   "pyramid_shares": 0,
   "last_order_time": "",
