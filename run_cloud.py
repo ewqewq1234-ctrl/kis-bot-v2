@@ -3,7 +3,9 @@ import json
 import logging
 from datetime import datetime
 import requests
-import pytz
+
+# KST 표준시 정의 (UTC + 9시간)
+KST = timezone(timedelta(hours=9))
 
 # 기 구축된 모듈 임포트
 from nh_client import NHClient
@@ -63,8 +65,7 @@ def save_state(state: dict):
 
 
 def run_strategy():
-    kst = pytz.timezone("Asia/Seoul")
-    now_kst = datetime.now(kst)
+    now_kst = datetime.now(KST)  # pytz 없이 표준 KST 시간 추출
     logger.info(f"=== B 전략 엔진 가동 ({now_kst.strftime('%Y-%m-%d %H:%M:%S')} KST) ===")
 
     client = NHClient()
