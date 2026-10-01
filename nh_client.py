@@ -14,7 +14,7 @@ class NHClient:
         self.app_key = os.getenv("NHPLUG_APP_KEY")
         self.app_secret = os.getenv("NHPLUG_APP_SECRET")
         self.account_no = os.getenv("NHPLUG_ACCOUNT_NO")
-        self.base_url = "https://openapi.nhqv.com"  # 실서버 도메인
+        self.base_url = "https://api.nhqv.com"  # 실서버 도메인
         self.access_token = self._get_valid_token()
 
     def _get_valid_token(self) -> str:
