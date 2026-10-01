@@ -1,4 +1,3 @@
-# nh_client.py
 import os
 import json
 import logging
@@ -14,13 +13,16 @@ class NHClient:
         self.app_key = os.getenv("NHPLUG_APP_KEY")
         self.app_secret = os.getenv("NHPLUG_APP_SECRET")
         self.account_no = os.getenv("NHPLUG_ACCOUNT_NO")
-        self.base_url = "https://api.nhqv.com"  # 실서버 도메인
+        
+        # [공식 명세 반영] 기본 운영 도메인 및 8443 포트 적용
+        self.base_url = "https://api.nhplug.com:8443"
         self.access_token = self._get_valid_token()
 
     def _get_valid_token(self) -> str:
-        """tokens.json 당일 캐싱 확인 및 OAuth2 토큰 발급"""
+        """tokens.json 캐싱 검사 및 공식 명세 기반 OAuth2 토큰 발급"""
         today_str = datetime.now(KST).strftime("%Y-%m-%d")
         
+        # 1. 당일 캐시된 유효 토큰 확인
         if os.path.exists(TOKEN_FILE):
             try:
                 with open(TOKEN_FILE, "r", encoding="utf-8") as f:
@@ -30,14 +32,20 @@ class NHClient:
             except Exception:
                 pass
 
-        # 토큰 신규 발급 (/oauth2/token) - application/x-www-form-urlencoded
+        # 2. 토큰 신규 발급 (/oauth2/token)
         url = f"{self.base_url}/oauth2/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        # 공식 필수 파라미터: appkey, appsecretkey, grant_type, scope
         data = {
             "grant_type": "client_credentials",
             "appkey": self.app_key,
-            "appsecretkey": self.app_secret
+            "appsecretkey": self.app_secret,
+            "scope": "oob"
         }
+        
+        logger.info(f"[*] 나무증권 토큰 발급 요청: {url}")
         res = requests.post(url, headers=headers, data=data, timeout=10)
         res_json = res.json()
         token = res_json.get("access_token")
@@ -45,6 +53,7 @@ class NHClient:
         if token:
             with open(TOKEN_FILE, "w", encoding="utf-8") as f:
                 json.dump({"issued_date": today_str, "access_token": token}, f, indent=2)
+            logger.info("[*] 토큰 발급 및 tokens.json 캐싱 완료")
             return token
         else:
             raise ValueError(f"토큰 발급 실패: {res_json}")
@@ -89,13 +98,13 @@ class NHClient:
         return {"total_asset": total_asset, "holdings": holdings}
 
     def order_cash_buy(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매수 주문"""
+        """시장가 현금 매수 주문 (/cashBuy)"""
         url = f"{self.base_url}/krstock/order/v1/cashBuy"
         body = {
             "acno": self.account_no,
             "iem_cd": symbol,
             "ord_qty": str(qty),
-            "nmn_pr_tp_cd": "05",  # 05: 시장가
+            "nmn_pr_tp_cd": "05",  # KRX 시장가
             "sor_mkt_sli_yn": "N"
         }
         res = requests.post(url, headers=self._headers("TTTC0802U"), json=body, timeout=5)
@@ -103,13 +112,13 @@ class NHClient:
         return data.get("rsp_cd") in ["00048", "00047", "00000"]
 
     def order_cash_sell(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매도 주문"""
+        """시장가 현금 매도 주문 (/cashSell)"""
         url = f"{self.base_url}/krstock/order/v1/cashSell"
         body = {
             "acno": self.account_no,
             "iem_cd": symbol,
             "ord_qty": str(qty),
-            "nmn_pr_tp_cd": "05",  # 05: 시장가
+            "nmn_pr_tp_cd": "05",  # KRX 시장가
             "sor_mkt_sli_yn": "N"
         }
         res = requests.post(url, headers=self._headers("TTTC0801U"), json=body, timeout=5)
