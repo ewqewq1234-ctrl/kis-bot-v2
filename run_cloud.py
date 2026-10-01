@@ -1,7 +1,7 @@
 import os
 import json
 import logging
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 import requests
 
 # KST 표준시 정의 (UTC + 9시간)
