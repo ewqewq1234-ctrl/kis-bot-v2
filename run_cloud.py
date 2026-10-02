@@ -1,141 +1,254 @@
 import os
 import json
-import time
+import logging
+from datetime import datetime, timezone, timedelta
 import requests
-from typing import Dict, Any, Optional
 
-BASE_URL = "https://api.nhplug.com:8443"  # 운영 환경 기준 (모의투자는 https://moapi.nhplug.com:8443)
-TOKEN_CACHE_FILE = "token_cache.json"
+# KST 표준시 정의 (UTC + 9시간)
+KST = timezone(timedelta(hours=9))
 
-class NHClient:
-    def __init__(self):
-        self.app_key = os.getenv("NH_APP_KEY")
-        self.app_secret = os.getenv("NH_APP_SECRET")
-        self.act_no = os.getenv("NH_ACCOUNT_NO")  # 11자리 계좌번호
-        self.access_token = self._get_valid_token()
+# 나무증권 클라이언트 모듈 (사용자 정의 NHClient)
+from nh_client import NHClient
 
-    def _get_valid_token(self) -> str:
-        """24시간 유효 토큰 로컬 파일 캐싱 및 재사용 (나무증권 가이드 준수)"""
-        now = time.time()
-        if os.path.exists(TOKEN_CACHE_FILE):
-            try:
-                with open(TOKEN_CACHE_FILE, "r", encoding="utf-8") as f:
-                    cache = json.load(f)
-                    if cache.get("expires_at", 0) > now + 600:  # 만료 10분 전까지 재사용
-                        return cache["access_token"]
-            except Exception:
-                pass
+logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+logger = logging.getLogger("StrategyB_Cloud")
 
-        # 토큰 신규 발급 (application/x-www-form-urlencoded, Params 전달)
-        url = f"{BASE_URL}/oauth2/token"
-        params = {
-            "grant_type": "client_credentials",
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "scope": "oob"
-        }
-        res = requests.post(url, params=params, timeout=10)
-        res.raise_for_status()
-        data = res.json()
-        
-        token = data["access_token"]
-        expires_in = int(data.get("expires_in", 86400))
-        
-        with open(TOKEN_CACHE_FILE, "w", encoding="utf-8") as f:
-            json.dump({"access_token": token, "expires_at": now + expires_in}, f)
-            
-        return token
+STATE_FILE = "state.json"
+SYMBOL = "069500"  # KODEX 200
 
-    def _headers(self) -> Dict[str, str]:
-        return {
-            "Content-Type": "application/json; charset=UTF-8",
-            "Authorization": f"Bearer {self.access_token}"
-        }
+# [B 전략] 핵심 매트릭스 파라미터
+WEIGHTS = [0.10, 0.20, 0.30, 0.40]   # 4단계 비대칭 자본금 비중
+STEP_DROP_RATE = 0.028                # 단계별 -2.8% 하락 시 추가 매수
+TS_TRIGGER_RATE = 0.020               # 1~2단계: 평단 대비 +2.0% 도달 시 TS 모드 가동
+TS_FALLBACK_RATE = 0.010              # 1~2단계: 최고가 대비 -1.0% 반락 시 익절
+ESCAPE_PROFIT_RATE = 0.0005           # 3~4단계: 평단 대비 +0.05% 도달 시 제비용 건지고 본전 탈출
 
-    def get_current_price(self, symbol: str) -> int:
-        """주식현재가 시세 조회 (/krstock/quote/v1/currentPrice)"""
-        url = f"{BASE_URL}/krstock/quote/v1/currentPrice"
-        payload = {
-            "Input_0": {
-                "market_cd": "KRX",
-                "iem_cd": symbol
-            }
-        }
-        res = requests.post(url, json=payload, headers=self._headers(), timeout=5)
-        if res.status_code == 200:
-            data = res.json()
-            out = data.get("Output_0", {})
-            return int(out.get("stck_prpr", 0))
-        return 0
 
-    def get_asset_status(self) -> Dict[str, Any]:
-        """계좌 자산 현황 조회 (/krstock/inquiry/v1/assetStatus)"""
-        url = f"{BASE_URL}/krstock/inquiry/v1/assetStatus"
-        payload = {
-            "Input_0": {
-                "act_no": self.act_no,
-                "eal_aly_cd": "2",      # 2: 시가평가
-                "aet_bse": "1",         # 1: 순자산
-                "qut_dit_cd": "KRX",
-                "aly_qut_cd": "1"       # 1: 정규장
-            }
-        }
-        res = requests.post(url, json=payload, headers=self._headers(), timeout=5)
-        result = {"total_asset": 0, "holdings": {}}
-        if res.status_code == 200:
-            data = res.json()
-            out0 = data.get("Output_0", {})
-            out1 = data.get("Output_1", [])
-            result["total_asset"] = float(out0.get("nas_amt", 0))  # 순자산금액
-            
-            for item in out1:
-                code = item.get("iem_cd")
-                result["holdings"][code] = {
-                    "qty": int(item.get("itg_bnc_qty", 0)),
-                    "avg_price": float(item.get("phs_pr", 0))
-                }
-        return result
+def send_telegram(message: str) -> None:
+    """텔레그램 알림 전송"""
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        logger.info(f"[Telegram 미설정] {message}")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as e:
+        logger.error(f"텔레그램 전송 실패: {e}")
 
-    def order_cash_buy(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매수 주문 (/krstock/order/v1/cashBuy)"""
-        url = f"{BASE_URL}/krstock/order/v1/cashBuy"
-        payload = {
-            "Input_0": {
-                "act_no": self.act_no,
-                "iem_cd": symbol,
-                "orr_qty": str(qty),
-                "orr_pr": "0",
-                "nmn_pr_tp_cd": "05",          # 05: 시장가
-                "orr_cnd_dit_cd": "00",        # 00: 조건없음
-                "ssl_nmn_pr_dit_cd": "00",    # 00: 정상
-                "rmt_mkt_cd": "KRX",           # KRX 요청
-                "sor_mkt_sli_yn": "N"          # SOR 미적용 시 N 필수
-            }
-        }
-        res = requests.post(url, json=payload, headers=self._headers(), timeout=5)
-        if res.status_code == 200:
-            out = res.json().get("Output_0", {})
-            return bool(out.get("mkt_orr_no"))
-        return False
 
-    def order_cash_sell(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매도 주문 (/krstock/order/v1/cashSell)"""
-        url = f"{BASE_URL}/krstock/order/v1/cashSell"
-        payload = {
-            "Input_0": {
-                "act_no": self.act_no,
-                "iem_cd": symbol,
-                "orr_qty": str(qty),
-                "orr_pr": "0",
-                "nmn_pr_tp_cd": "05",          # 05: 시장가
-                "orr_cnd_dit_cd": "00",        # 00: 없음
-                "ssl_nmn_pr_dit_cd": "00",    # 00: 정상
-                "rmt_mkt_cd": "KRX",
-                "sor_mkt_sli_yn": "N"
-            }
-        }
-        res = requests.post(url, json=payload, headers=self._headers(), timeout=5)
-        if res.status_code == 200:
-            out = res.json().get("Output_0", {})
-            return bool(out.get("mkt_orr_no"))
-        return False
+def load_state() -> dict:
+    """state.json 상태 복원 (Actions 컨테이너 휘발 방지)"""
+    default_state = {
+        "symbol": SYMBOL,
+        "current_step": 0,
+        "entry_prices": [],
+        "trailing_mode": False,
+        "highest_price": 0,
+        "last_run": ""
+    }
+    if os.path.exists(STATE_FILE):
+        try:
+            with open(STATE_FILE, "r", encoding="utf-8") as f:
+                return json.load(f)
+        except Exception as e:
+            logger.warning(f"state.json 로드 실패, 기본값으로 초기화: {e}")
+    return default_state
+
+
+def save_state(state: dict) -> None:
+    """state.json 최신화"""
+    with open(STATE_FILE, "w", encoding="utf-8") as f:
+        json.dump(state, f, indent=2, ensure_ascii=False)
+
+
+def run_strategy():
+    now_kst = datetime.now(KST)
+    logger.info(f"=== B 전략 엔진 가동 ({now_kst.strftime('%Y-%m-%d %H:%M:%S')} KST) ===")
+
+    client = NHClient()
+    state = load_state()
+
+    # 1. NH투자증권 실제 자산 및 잔고 조회 (/krstock/inquiry/v1/assetStatus 기반)
+    asset_info = client.get_asset_status()
+    total_asset = float(asset_info.get("total_asset", 0))       # Output_0.nas_amt (순자산)
+    holding_data = asset_info.get("holdings", {}).get(SYMBOL, {})
+    holding_qty = int(holding_data.get("qty", 0))               # Output_1.itg_bnc_qty (실제 보유수량)
+    account_avg_price = float(holding_data.get("avg_price", 0)) # Output_1.phs_pr (증권사 공식 평단가)
+
+    # 2. 실시간 시세 조회 (/krstock/quote/v1/currentPrice 기반)
+    current_price = client.get_current_price(SYMBOL)
+    if current_price <= 0:
+        logger.error("시세 조회 실패(0원)로 안전을 위해 이번 루틴을 중단합니다.")
+        return
+
+    logger.info(
+        f"[*] 실계좌 데이터 동기화 완료: 종목={SYMBOL}, 현재가={current_price:,}원, "
+        f"총자산={total_asset:,.0f}원, 보유수량={holding_qty:,}주, 평단가={account_avg_price:,.1f}원"
+    )
+
+    # 3. 자체 치유(Self-Healing) 로직
+    if holding_qty == 0 and state["current_step"] > 0:
+        logger.info("[자체 치유] 증권사 잔고가 0주이므로 state.json 포지션을 초기화합니다.")
+        state["current_step"] = 0
+        state["entry_prices"] = []
+        state["trailing_mode"] = False
+        state["highest_price"] = 0
+        save_state(state)
+
+    elif holding_qty > 0 and state["current_step"] == 0:
+        recovered_price = int(account_avg_price) if account_avg_price > 0 else current_price
+        logger.info(f"[자체 치유] 실제 보유 수량 감지: 1단계 상태로 강제 복구 (기준가={recovered_price:,}원)")
+        state["current_step"] = 1
+        state["entry_prices"] = [recovered_price]
+        state["trailing_mode"] = False
+        state["highest_price"] = max(recovered_price, current_price)
+        save_state(state)
+
+    effective_avg = account_avg_price if account_avg_price > 0 else (
+        sum(state["entry_prices"]) / len(state["entry_prices"]) if state["entry_prices"] else float(current_price)
+    )
+
+    # -------------------------------------------------------------------------
+    # [조건 1] 포지션 미보유 시: 1단계 신규 진입 (10% 비중)
+    # -------------------------------------------------------------------------
+    if state["current_step"] == 0:
+        allocated_budget = total_asset * WEIGHTS[0]
+        order_qty = int(allocated_budget // current_price)
+        if order_qty > 0:
+            logger.info(f"▶ [1단계 신규 진입] 예산: {allocated_budget:,.0f}원 -> 시장가 {order_qty:,}주 매수")
+            order_no = client.order_cash_buy(SYMBOL, order_qty)
+            if order_no:
+                state["current_step"] = 1
+                state["entry_prices"] = [current_price]
+                state["trailing_mode"] = False
+                state["highest_price"] = current_price
+                save_state(state)
+                send_telegram(
+                    f"🟢 <b>[KODEX 200] 1단계 진입 체결</b>\n"
+                    f"• 주문번호: {order_no}\n"
+                    f"• 체결단가: {current_price:,}원\n"
+                    f"• 매수수량: {order_qty:,}주\n"
+                    f"• 투입비중: 10% ({allocated_budget:,.0f}원)"
+                )
+        return
+
+    # -------------------------------------------------------------------------
+    # [조건 2] 청산 매트릭스 판정
+    # -------------------------------------------------------------------------
+    # 2-A. 1~2단계: 트레일링 스탑 (+2.0% 도달 후 고점 대비 -1.0% 반락 시 매도)
+    if state["current_step"] in [1, 2]:
+        ts_trigger_price = effective_avg * (1 + TS_TRIGGER_RATE)
+
+        # 트레일링 모드 미가동 상태에서 +2.0% 도달 여부 검사
+        if not state.get("trailing_mode", False) and current_price >= ts_trigger_price:
+            logger.info(f"★ [트레일링 모드 가동] 평단(+2.0%) 돌파: 현재가 {current_price:,}원 >= 트리거 {ts_trigger_price:,.0f}원")
+            state["trailing_mode"] = True
+            state["highest_price"] = current_price
+            save_state(state)
+            send_telegram(
+                f"🎯 <b>[KODEX 200] 트레일링 스탑 가동</b>\n"
+                f"• 현재가: {current_price:,}원 (평단 대비 +2.0% 돌파)\n"
+                f"• 최고가 추적 시작, 고점 대비 -1.0% 반락 시 익절 집행"
+            )
+
+        # 트레일링 추적 및 익절 청산 실행
+        if state.get("trailing_mode", False):
+            if current_price > state.get("highest_price", 0):
+                state["highest_price"] = current_price
+                save_state(state)
+                logger.info(f"[*] 최고가 갱신: {current_price:,}원")
+
+            ts_stop_price = state["highest_price"] * (1 - TS_FALLBACK_RATE)
+            if current_price <= ts_stop_price:
+                logger.info(f"★ [트레일링 익절 조건 충족] 현재가 {current_price:,}원 <= 스탑가 {ts_stop_price:,.0f}원. 전량 매도")
+                order_no = client.order_cash_sell(SYMBOL, holding_qty)
+                if order_no:
+                    profit_pct = ((current_price / effective_avg) - 1) * 100
+                    send_telegram(
+                        f"🎉 <b>[KODEX 200] 트레일링 익절 완료</b>\n"
+                        f"• 주문번호: {order_no}\n"
+                        f"• 청산수량: {holding_qty:,}주\n"
+                        f"• 매도가격: {current_price:,}원\n"
+                        f"• 수익률: +{profit_pct:.2f}%\n"
+                        f"• 사이클 종료 및 상태 초기화"
+                    )
+                    state["current_step"] = 0
+                    state["entry_prices"] = []
+                    state["trailing_mode"] = False
+                    state["highest_price"] = 0
+                    save_state(state)
+                return
+
+    # 2-B. 3~4단계: 비상 본전 탈출 (평단가 대비 +0.05% 도달 시 전량 청산)
+    elif state["current_step"] in [3, 4]:
+        escape_price = effective_avg * (1 + ESCAPE_PROFIT_RATE)
+        if current_price >= escape_price:
+            logger.info(f"★ [비상 본전 탈출 충족] 현재가 {current_price:,}원 >= 탈출목표가 {escape_price:,.0f}원")
+            order_no = client.order_cash_sell(SYMBOL, holding_qty)
+            if order_no:
+                send_telegram(
+                    f"🛡️ <b>[KODEX 200] 비상 본전 탈출 체결 (무손실)</b>\n"
+                    f"• 주문번호: {order_no}\n"
+                    f"• 탈출단계: {state['current_step']}단계\n"
+                    f"• 매도단가: {current_price:,}원 (평단가 {effective_avg:,.1f}원)\n"
+                    f"• 청산수량: {holding_qty:,}주\n"
+                    f"• 원금 전액 회수 성공"
+                )
+                state["current_step"] = 0
+                state["entry_prices"] = []
+                state["trailing_mode"] = False
+                state["highest_price"] = 0
+                save_state(state)
+            return
+
+    # -------------------------------------------------------------------------
+    # [조건 3] 단계별 추가 분할 매수 판정 (직전 체결가 대비 -2.8% 하락 시)
+    # -------------------------------------------------------------------------
+    if state["current_step"] < 4:
+        last_price = state["entry_prices"][-1]
+        next_trigger_price = last_price * (1 - STEP_DROP_RATE)
+
+        if current_price <= next_trigger_price:
+            next_step = state["current_step"] + 1
+            allocated_budget = total_asset * WEIGHTS[next_step - 1]
+            order_qty = int(allocated_budget // current_price)
+
+            if order_qty > 0:
+                logger.info(f"▼ [{next_step}단계 물타기 진입] 현재가 {current_price:,}원 <= 기준가 {next_trigger_price:,.0f}원")
+                order_no = client.order_cash_buy(SYMBOL, order_qty)
+                if order_no:
+                    state["current_step"] = next_step
+                    state["entry_prices"].append(current_price)
+                    state["trailing_mode"] = False
+                    state["highest_price"] = current_price
+                    save_state(state)
+                    send_telegram(
+                        f"⚠️ <b>[KODEX 200] {next_step}단계 추가 분할 매수</b>\n"
+                        f"• 주문번호: {order_no}\n"
+                        f"• 직전단가 대비 -2.8% 하락 감지\n"
+                        f"• 체결단가: {current_price:,}원 | 수량: {order_qty:,}주\n"
+                        f"• 비중 투입: {WEIGHTS[next_step - 1] * 100:.0f}% ({allocated_budget:,.0f}원)"
+                    )
+            return
+
+    # 4. 장 마감 일일 결산 브리핑 (15:00 ~ 15:30)
+    if now_kst.hour == 15 and now_kst.minute < 30:
+        unrealized_pct = ((current_price / effective_avg) - 1) * 100 if holding_qty > 0 else 0.0
+        send_telegram(
+            f"📊 <b>[KODEX 200] 정규장 마감 일일 결산</b>\n"
+            f"• 종가: {current_price:,}원\n"
+            f"• 포지션 단계: {state['current_step']}/4단계\n"
+            f"• 보유 수량: {holding_qty:,}주\n"
+            f"• 평가 손익률: {unrealized_pct:+.2f}%\n"
+            f"• 트레일링 가동 여부: {state.get('trailing_mode', False)}"
+        )
+
+    state["last_run"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    save_state(state)
+
+
+if __name__ == "__main__":
+    run_strategy()
