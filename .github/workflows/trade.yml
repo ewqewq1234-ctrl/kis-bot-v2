@@ -1,12 +1,15 @@
-name: ETF Grid Trading Bot
+name: ETF Grid Trading Bot (Strategy B)
 
 on:
   schedule:
-    # 1. 정규장 매 정각 감시 (KST 09:00 ~ 15:00 -> UTC 00:00 ~ 06:00)
+    # 1. 정규장 매 정각 감시 (KST 09:00 ~ 15:00 -> UTC 00:00 ~ 06:00, 월~금)
     - cron: '0 0-6 * * 1-5'
-    # 2. 장 마감 일일 결산 브리핑 실행 (KST 15:35 -> UTC 06:35)
+    # 2. 장 마감 일일 결산 브리핑 실행 (KST 15:35 -> UTC 06:35, 월~금)
     - cron: '35 6 * * 1-5'
   workflow_dispatch:
+
+permissions:
+  contents: write  # state.json 저장을 위한 푸시 권한 부여
 
 jobs:
   trade:
@@ -19,25 +22,53 @@ jobs:
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
+          cache: 'pip'
 
-      - name: 필수 라이브러리 설치
+      - name: 의존성 라이브러리 설치
         run: |
           python -m pip install --upgrade pip
-          pip install requests
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; else pip install requests; fi
 
-      - name: 봇 1회 체크 및 매매 실행
+      - name: KST 날짜 확인 (토큰 캐시 키 생성용)
+        id: date
+        run: echo "date=$(TZ='Asia/Seoul' date +'%Y-%m-%d')" >> $GITHUB_OUTPUT
+
+      - name: 나무증권 24시간 Access Token 캐시 복원
+        uses: actions/cache@v4
+        with:
+          path: tokens.json
+          key: nhplug-token-${{ steps.date.outputs.date }}
+          restore-keys: |
+            nhplug-token-
+
+      - name: 봇 1회 체크 및 전략 B 실행
         env:
-          NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
-          NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
-          NH_ACCOUNT_NO: ${{ secrets.NH_ACCOUNT_NO }}
+          # 나무증권 공식 표준 환경변수 규약 준수
+          NHPLUG_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NHPLUG_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NHPLUG_ACCOUNT_NO: ${{ secrets.NHPLUG_ACCOUNT_NO }}
+          NHPLUG_BASE_URL: "https://api.nhplug.com:8443"
+          NHPLUG_AUTH_URL: "https://api.nhplug.com:8443"
+          # 이전 변수명과의 하위 호환성 유지
+          NH_APP_KEY: ${{ secrets.NHPLUG_APP_KEY }}
+          NH_APP_SECRET: ${{ secrets.NHPLUG_APP_SECRET }}
+          NH_ACCOUNT_NO: ${{ secrets.NHPLUG_ACCOUNT_NO }}
+          # 텔레그램 연동
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
         run: |
           python run_cloud.py
 
-      - name: 변경된 상태 파일(state/tokens) 깃허브 저장
+      - name: 전략 B 매매 상태(state.json) 깃허브 저장
         run: |
           git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          # tokens.json은 보안상 커밋에서 제외하고 state.json만 반영
+          if [ -f state.json ]; then
+            git add state.json
+            git diff-index --quiet HEAD || git commit -m "Auto: Update Strategy B state [skip ci]"
+            git push origin HEAD || true
+          fi
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git add state.json tokens.json || true
           git commit -m "Auto: Update state and tokens [skip ci]" || true
