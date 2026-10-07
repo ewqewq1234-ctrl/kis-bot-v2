@@ -38,7 +38,11 @@ def load_state() -> dict:
     """state.json 안전 복원: 파일이 손상되었거나 키가 누락되어도 default_state와 안전 병합"""
     default_state = {
         "symbol": SYMBOL,
+        "current_stage": 0,
         "current_step": 0,
+        "shares": 0,
+        "avg_price": 0.0,
+        "last_buy_price": 0.0,
         "entry_prices": [],
         "trailing_mode": False,
         "highest_price": 0,
@@ -49,7 +53,6 @@ def load_state() -> dict:
             with open(STATE_FILE, "r", encoding="utf-8") as f:
                 loaded = json.load(f)
                 if isinstance(loaded, dict):
-                    # 누락된 키가 있으면 default_state의 기본값으로 채워 넣음
                     for k, v in default_state.items():
                         if k not in loaded:
                             loaded[k] = v
@@ -80,21 +83,23 @@ def run_strategy():
 
     # 2. 실시간 시세 조회 (/krstock/quote/v1/currentPrice)
     current_price = client.get_current_price(SYMBOL)
-    if current_price <= 0:
-        logger.error("시세 조회 실패로 안전을 위해 이번 루틴을 중단합니다.")
+    if current_price is None or current_price <= 0:
+        logger.error("시세 조회 실패 또는 장 마감 세션으로 이번 루틴을 안전하게 중단합니다.")
         return
 
     logger.info(
-        f"[*] 실계좌 데이터 동기화 완료: 종목={SYMBOL}, 현재가={current_price:,}원, "
+        f"[*] 실계좌 데이터 동기화: 종목={SYMBOL}, 현재가={current_price:,}원, "
         f"총자산={total_asset:,.0f}원, 보유수량={holding_qty:,}주, 평단가={account_avg_price:,.1f}원"
     )
 
-    # 3. 자체 치유(Self-Healing) 로직: .get()으로 안전하게 단계 조회
+    # 3. 자체 치유(Self-Healing) 로직 보정
     current_step = state.get("current_step", 0)
 
     if holding_qty == 0 and current_step > 0:
-        logger.info("[자체 치유] 증권사 잔고가 0주이므로 state.json 상태를 초기화합니다.")
+        logger.info("[자체 치유] 증권사 잔고 0주 확인 -> state.json 포지션 리셋")
         state["current_step"] = 0
+        state["current_stage"] = 0
+        state["shares"] = 0
         state["entry_prices"] = []
         state["trailing_mode"] = False
         state["highest_price"] = 0
@@ -102,14 +107,35 @@ def run_strategy():
 
     elif holding_qty > 0 and current_step == 0:
         rec_price = int(account_avg_price) if account_avg_price > 0 else current_price
-        logger.info(f"[자체 치유] 실제 잔고 감지: 1단계 상태로 강제 복구 (기준가={rec_price:,}원)")
-        state["current_step"] = 1
-        state["entry_prices"] = [rec_price]
+        
+        # 보유 수량이 7주 이상(현재 10주)이면 2단계로 복구
+        if holding_qty >= 7:
+            logger.info(f"[자체 치유] 실제 잔고 {holding_qty}주 감지 -> 2단계 상태로 자동 복구 (기준가={rec_price:,}원)")
+            state["current_step"] = 2
+            state["current_stage"] = 2
+            state["shares"] = holding_qty
+            state["avg_price"] = rec_price
+            state["last_buy_price"] = rec_price
+            state["entry_prices"] = [rec_price, rec_price]
+        else:
+            logger.info(f"[자체 치유] 실제 잔고 {holding_qty}주 감지 -> 1단계 상태로 자동 복구 (기준가={rec_price:,}원)")
+            state["current_step"] = 1
+            state["current_stage"] = 1
+            state["shares"] = holding_qty
+            state["avg_price"] = rec_price
+            state["last_buy_price"] = rec_price
+            state["entry_prices"] = [rec_price]
+
         state["trailing_mode"] = False
         state["highest_price"] = max(rec_price, current_price)
         save_state(state)
 
+    # 단계 동기화
     current_step = state.get("current_step", 0)
+    state["shares"] = holding_qty
+    if account_avg_price > 0:
+        state["avg_price"] = account_avg_price
+
     effective_avg = account_avg_price if account_avg_price > 0 else (
         sum(state["entry_prices"]) / len(state["entry_prices"]) if state.get("entry_prices") else float(current_price)
     )
@@ -124,6 +150,10 @@ def run_strategy():
             logger.info(f"▶ [1단계 신규 진입] 예산: {allocated_budget:,.0f}원 -> 시장가 {order_qty:,}주 매수")
             if client.order_cash_buy(SYMBOL, order_qty):
                 state["current_step"] = 1
+                state["current_stage"] = 1
+                state["shares"] = order_qty
+                state["avg_price"] = current_price
+                state["last_buy_price"] = current_price
                 state["entry_prices"] = [current_price]
                 state["trailing_mode"] = False
                 state["highest_price"] = current_price
@@ -162,7 +192,7 @@ def run_strategy():
 
             ts_stop_price = state["highest_price"] * (1 - TS_FALLBACK_RATE)
             if current_price <= ts_stop_price:
-                logger.info(f"★ [트레일링 익절 조건 충족] 현재가 {current_price:,}원 <= 스탑가 {ts_stop_price:,.0f}원. 전량 매도")
+                logger.info(f"★ [트레일링 익절 충족] 현재가 {current_price:,}원 <= 스탑가 {ts_stop_price:,.0f}원. 전량 매도")
                 if client.order_cash_sell(SYMBOL, holding_qty):
                     profit_pct = ((current_price / effective_avg) - 1) * 100
                     send_telegram(
@@ -173,6 +203,8 @@ def run_strategy():
                         f"• 사이클 종료 및 상태 초기화"
                     )
                     state["current_step"] = 0
+                    state["current_stage"] = 0
+                    state["shares"] = 0
                     state["entry_prices"] = []
                     state["trailing_mode"] = False
                     state["highest_price"] = 0
@@ -193,6 +225,8 @@ def run_strategy():
                     f"• 원금 전액 회수 성공"
                 )
                 state["current_step"] = 0
+                state["current_stage"] = 0
+                state["shares"] = 0
                 state["entry_prices"] = []
                 state["trailing_mode"] = False
                 state["highest_price"] = 0
@@ -215,6 +249,7 @@ def run_strategy():
                 logger.info(f"▼ [{next_step}단계 물타기 진입] 현재가 {current_price:,}원 <= 기준가 {next_trigger_price:,.0f}원")
                 if client.order_cash_buy(SYMBOL, order_qty):
                     state["current_step"] = next_step
+                    state["current_stage"] = next_step
                     state["entry_prices"].append(current_price)
                     state["trailing_mode"] = False
                     state["highest_price"] = current_price
