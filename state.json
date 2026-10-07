@@ -1,26 +1,21 @@
 {
+  "symbol": "069500",
   "initial_seed": 3000000,
   "total_capital": 3001614.0,
   "current_stage": 2,
+  "current_step": 2,
   "shares": 10,
   "avg_price": 111467.0,
   "last_buy_price": 111540.0,
-  "first_buy_date": "",
+  "entry_prices": [
+    111467,
+    111540
+  ],
   "trailing_mode": false,
   "highest_price": 112060,
   "total_profit_accumulated": 0,
   "cycle_win_count": 0,
   "cycle_draw_count": 0,
-  "last_summary_date": "2026-10-01",
-  "pyramid_mode": false,
-  "pyramid_shares": 0,
-  "last_order_time": "",
-  "holding_bars": 12,
-  "symbol": "069500",
-  "current_step": 2,
-  "entry_prices": [
-    111467
-    111540
-  ],
+  "last_summary_date": "2026-10-07",
   "last_run": "2026-10-07 15:50:50"
 }
