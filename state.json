@@ -17,9 +17,10 @@
   "last_order_time": "",
   "holding_bars": 12,
   "symbol": "069500",
-  "current_step": 1,
+  "current_step": 2,
   "entry_prices": [
     111467
+    111540
   ],
   "last_run": "2026-10-07 15:50:50"
 }
