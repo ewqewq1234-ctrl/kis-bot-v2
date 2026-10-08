@@ -135,7 +135,7 @@ class NHClient:
             return {"total_asset": 0.0, "holdings": {}}
 
     def order_cash_buy(self, ticker, qty, price=0):
-        """나무증권 KRX 시장가 현금 매수 (규격 및 체결 응답 검증)"""
+        """나무증권 현금 매수 (규약 준수 및 거절 메시지 판정)"""
         act_no = str(self.account_no).replace("-", "").strip()
         is_market = (price == 0)
 
@@ -156,15 +156,15 @@ class NHClient:
             data = self._post("/krstock/order/v1/cashBuy", payload)
             rsp_msg = data.get("rsp_msg", "")
             
-            # 장 종료 또는 오류 키워드 감지 시 실패 처리
-            if any(fail_word in rsp_msg for fail_word in ["종료", "불가", "오류", "거절", "잔고부족"]):
-                logger.warning(f"[주문 접수 거절] {ticker} {qty}주 | 사유: {rsp_msg}")
+            # HTTP 200이어도 rsp_msg에 거절/종료 메시지가 있으면 실패 처리
+            if any(k in rsp_msg for k in ["종료", "불가", "오류", "거절", "한도초과", "잔고부족"]):
+                logger.warning(f"[주문 거절/미접수] {ticker} {qty}주 | 사유: {rsp_msg}")
                 return False
 
-            logger.info(f"[주문 접수 성공] {ticker} {qty}주 | {rsp_msg}")
+            logger.info(f"[주문 접수 완료] {ticker} {qty}주 | {rsp_msg}")
             return True
         except Exception as e:
-            logger.error(f"[매수 주문 전송 실패]: {e}")
+            logger.error(f"[주문 전송 예외]: {e}")
             return False
 
     def order_cash_sell(self, ticker, qty, price=0):
