@@ -65,19 +65,46 @@ class NHClient:
             "Authorization": f"Bearer {self.access_token}"
         }
 
-    def _post(self, path: str, payload: dict) -> dict:
-        """공통 POST 래퍼: Input_0 봉투 주입, 401 시 1회 재발급, 초당 5회 유량 보호"""
-        url = f"{BASE_URL}{path}"
-        body = {"Input_0": payload}
-
-        res = requests.post(url, headers=self._headers(), json=body, timeout=10)
-        if res.status_code == 401:  # 토큰 무효 시 1회 재발급
-            self.access_token = self._get_valid_token()
-            res = requests.post(url, headers=self._headers(), json=body, timeout=10)
-
-        res.raise_for_status()
-        time.sleep(0.2)  # 초당 5회 제한 보호
+    def _post(self, path, payload):
+        url = f"{self.BASE_URL}{path}"
+        headers = self._get_auth_headers()
+        res = self.session.post(url, headers=headers, json=payload, timeout=10)
+        
+        # 증권사 거절 메시지 확인을 위한 상세 로깅
+        if res.status_code != 200:
+            print(f"[API 호출 오류] URL: {path} | HTTP {res.status_code} | 본문: {res.text}")
+            res.raise_for_status()
+            
         return res.json()
+
+    def order_cash_buy(self, ticker, qty, price=0):
+        """나무증권 KRX 시장가 현금 매수"""
+        account_no = str(self.account_no).replace("-", "").strip()
+        is_market = (price == 0)
+
+        # 시장가('05')일 때는 orr_pr을 0(정수) 또는 생략[cite: 3]
+        payload = {
+            "Input_0": {
+                "act_no": account_no,
+                "iem_cd": str(ticker).replace("A", "").strip(),  # 6자리 종목코드[cite: 3]
+                "orr_qty": int(qty),
+                "orr_pr": 0 if is_market else int(price),
+                "nmn_pr_tp_cd": "05" if is_market else "01",      # 시장가 05, 지정가 01[cite: 3]
+                "orr_cnd_dit_cd": "00",
+                "ssl_nmn_pr_dit_cd": "00",
+                "rmt_mkt_cd": "KRX",
+                "sor_mkt_sli_yn": "N"
+            }
+        }
+
+        try:
+            res = self._post("/krstock/order/v1/cashBuy", payload)
+            rsp_msg = res.get("rsp_msg", "")
+            print(f"[주문 전송 결과] 매수 {qty}주 | {rsp_msg}")
+            return True
+        except Exception as e:
+            print(f"[주문 실패 예외]: {e}")
+            raise
 
     def get_current_price(self, symbol: str) -> int:
         """국내주식 현재가 조회 (/krstock/quote/v1/currentPrice)"""
