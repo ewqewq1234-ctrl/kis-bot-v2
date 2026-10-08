@@ -1,191 +1,189 @@
 import os
 import json
 import logging
-import time
 import requests
-from typing import Dict, Any, Optional
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+from datetime import datetime, timezone, timedelta
 
 logger = logging.getLogger("NHClient")
-TOKEN_FILE = "tokens.json"
-BASE_URL = "https://api.nhplug.com:8443"
-
 
 class NHClient:
-    def __init__(self):
-        self.app_key = os.getenv("NH_APP_KEY")
-        self.app_secret = os.getenv("NH_APP_SECRET")
-        self.act_no = os.getenv("NH_ACCOUNT_NO")  # 11자리 계좌번호
-        self.access_token = self._get_valid_token()
+    # BASE_URL 정의 (나무증권 실거래 게이트웨이)
+    BASE_URL = "https://api.nhplug.com:8443"
 
-    def _get_valid_token(self) -> str:
-        """24시간 유효 토큰 파일 캐싱 및 나무증권 공식 Body(x-www-form-urlencoded) 발급"""
-        now = time.time()
-        if os.path.exists(TOKEN_FILE):
-            try:
-                with open(TOKEN_FILE, "r", encoding="utf-8") as f:
-                    tdata = json.load(f)
-                    if tdata.get("expires_at", 0) > now + 600:
-                        return tdata["access_token"]
-            except Exception:
-                pass
+    def __init__(self, app_key=None, app_secret=None, account_no=None):
+        self.app_key = app_key or os.getenv("NH_APP_KEY")
+        self.app_secret = app_secret or os.getenv("NH_APP_SECRET")
+        self.account_no = account_no or os.getenv("NH_ACCOUNT_NO")
+        self.token_file = "tokens.json"
+        self.access_token = None
 
-        if not self.app_key or not self.app_secret:
-            raise ValueError("[인증 오류] NH_APP_KEY 또는 NH_APP_SECRET 환경변수가 비어 있습니다.")
+        self.session = requests.Session()
+        retries = Retry(
+            total=3,
+            backoff_factor=1,
+            status_forcelist=[500, 502, 503, 504],
+            raise_on_status=False
+        )
+        adapter = HTTPAdapter(max_retries=retries)
+        self.session.mount("https://", adapter)
+        self.session.mount("http://", adapter)
 
-        # 운영 전용 토큰 엔드포인트
-        url = f"{BASE_URL}/oauth2/token"
-        headers = {
-            "Content-Type": "application/x-www-form-urlencoded"
-        }
-        # 쿼리 파라미터가 아닌 Body(data)로 전달해야 403 차단을 방지함
-        data = {
-            "grant_type": "client_credentials",
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "scope": "oob"
-        }
-        res = requests.post(url, headers=headers, data=data, timeout=10)
-        res.raise_for_status()
-        res_json = res.json()
+        self._load_or_refresh_token()
 
-        token = res_json.get("access_token")
-        expires_in = int(res_json.get("expires_in", 86400))
-
-        if token:
-            with open(TOKEN_FILE, "w", encoding="utf-8") as f:
-                json.dump({"access_token": token, "expires_at": now + expires_in}, f, indent=2)
-            return token
-        else:
-            raise ValueError(f"토큰 발급 실패: {res_json}")
-
-    def _headers(self) -> Dict[str, str]:
-        """나무증권 REST 헤더: Authorization: Bearer {token} 단일 규약"""
+    def _get_auth_headers(self):
         return {
             "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {self.access_token}"
+            "Authorization": f"Bearer {self.access_token}",
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "cts": "",
+            "cts_flag": ""
         }
+
+    def _load_or_refresh_token(self):
+        kst = timezone(timedelta(hours=9))
+        today_str = datetime.now(kst).strftime("%Y-%m-%d")
+
+        if os.path.exists(self.token_file):
+            try:
+                with open(self.token_file, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                    if data.get("issued_date") == today_str:
+                        self.access_token = data.get("access_token")
+                        return
+            except Exception:
+                pass
+        self._issue_token()
+
+    def _issue_token(self):
+        url = f"{self.BASE_URL}/oauth2/token"
+        headers = {"Content-Type": "application/x-www-form-urlencoded"}
+        data = {
+            "appkey": self.app_key,
+            "appsecretkey": self.app_secret,
+            "grant_type": "client_credentials",
+            "scope": "oob"
+        }
+        res = self.session.post(url, headers=headers, data=data, timeout=10)
+        res.raise_for_status()
+        token_info = res.json()
+        self.access_token = token_info.get("access_token")
+
+        kst = timezone(timedelta(hours=9))
+        today_str = datetime.now(kst).strftime("%Y-%m-%d")
+        with open(self.token_file, "w", encoding="utf-8") as f:
+            json.dump({"access_token": self.access_token, "issued_date": today_str}, f)
 
     def _post(self, path, payload):
         url = f"{self.BASE_URL}{path}"
         headers = self._get_auth_headers()
-        res = self.session.post(url, headers=headers, json=payload, timeout=10)
+        res = self.session.post(url, headers=headers, json=payload, timeout=(10, 20))
         
-        # 증권사 거절 메시지 확인을 위한 상세 로깅
+        # 상세 거절 원인 확인을 위한 본문 로깅
         if res.status_code != 200:
-            print(f"[API 호출 오류] URL: {path} | HTTP {res.status_code} | 본문: {res.text}")
+            logger.error(f"[API 호출 오류] {path} | HTTP {res.status_code} | 본문: {res.text}")
             res.raise_for_status()
             
         return res.json()
 
-    def order_cash_buy(self, ticker, qty, price=0):
-        """나무증권 KRX 시장가 현금 매수"""
-        account_no = str(self.account_no).replace("-", "").strip()
-        is_market = (price == 0)
-
-        # 시장가('05')일 때는 orr_pr을 0(정수) 또는 생략[cite: 3]
+    def get_current_price(self, ticker="069500"):
         payload = {
             "Input_0": {
-                "act_no": account_no,
-                "iem_cd": str(ticker).replace("A", "").strip(),  # 6자리 종목코드[cite: 3]
+                "market_cd": "KRX",
+                "iem_cd": str(ticker).replace("A", "").strip(),
+                "view_main_yn": "N"
+            }
+        }
+        try:
+            data = self._post("/krstock/quote/v1/currentExecution", payload)
+            out_1 = data.get("Output_1") or {}
+            price = out_1.get("stck_prpr")
+            return float(str(price).replace(",", "").strip()) if price else 0.0
+        except Exception as e:
+            logger.error(f"시세 조회 예외: {e}")
+            return 0.0
+
+    def get_asset_status(self):
+        act_no = str(self.account_no).replace("-", "").strip()
+        payload = {
+            "Input_0": {
+                "act_no": act_no,
+                "eal_aly_cd": "2",
+                "aet_bse": "1",
+                "qut_dit_cd": "UNT",
+                "aly_qut_cd": "2"
+            }
+        }
+        try:
+            data = self._post("/krstock/inquiry/v1/assetStatus", payload)
+            out_0 = data.get("Output_0") or {}
+            total_asset = float(out_0.get("nas_amt") or out_0.get("tot_aet_amt") or 0.0)
+
+            holdings = {}
+            for item in (data.get("Output_1") or []):
+                sym = str(item.get("iem_cd") or "").replace("A", "").strip()
+                holdings[sym] = {
+                    "qty": int(float(item.get("itg_bnc_qty") or 0)),
+                    "avg_price": float(item.get("phs_pr") or 0.0)
+                }
+
+            return {"total_asset": total_asset, "holdings": holdings}
+        except Exception as e:
+            logger.error(f"자산 조회 예외: {e}")
+            return {"total_asset": 0.0, "holdings": {}}
+
+    def order_cash_buy(self, ticker, qty, price=0):
+        """나무증권 KRX 시장가 현금 매수 (규격 준수)"""
+        act_no = str(self.account_no).replace("-", "").strip()
+        is_market = (price == 0)
+
+        payload = {
+            "Input_0": {
+                "act_no": act_no,
+                "iem_cd": str(ticker).replace("A", "").strip(),
                 "orr_qty": int(qty),
                 "orr_pr": 0 if is_market else int(price),
-                "nmn_pr_tp_cd": "05" if is_market else "01",      # 시장가 05, 지정가 01[cite: 3]
+                "nmn_pr_tp_cd": "05" if is_market else "01",
                 "orr_cnd_dit_cd": "00",
                 "ssl_nmn_pr_dit_cd": "00",
                 "rmt_mkt_cd": "KRX",
                 "sor_mkt_sli_yn": "N"
             }
         }
-
         try:
-            res = self._post("/krstock/order/v1/cashBuy", payload)
-            rsp_msg = res.get("rsp_msg", "")
-            print(f"[주문 전송 결과] 매수 {qty}주 | {rsp_msg}")
+            data = self._post("/krstock/order/v1/cashBuy", payload)
+            rsp_msg = data.get("rsp_msg", "")
+            logger.info(f"[매수 접수 성공] {ticker} {qty}주 | {rsp_msg}")
             return True
         except Exception as e:
-            print(f"[주문 실패 예외]: {e}")
-            raise
-
-    def get_current_price(self, symbol: str) -> int:
-        """국내주식 현재가 조회 (/krstock/quote/v1/currentPrice)"""
-        payload = {
-            "market_cd": "KRX",
-            "iem_cd": symbol
-        }
-        data = self._post("/krstock/quote/v1/currentPrice", payload)
-        out0 = data.get("Output_0") or {}
-        price = out0.get("stck_prpr")
-        return int(price) if price else 0
-
-    def get_asset_status(self) -> dict:
-        """투자계좌자산현황조회 (/krstock/inquiry/v1/assetStatus) - KRX 거래시간 연장 규약"""
-        payload = {
-            "act_no": self.act_no,
-            "eal_aly_cd": "2",  # 2: 시가평가
-            "aet_bse": "1",      # 1: 순자산
-            "qut_dit_cd": "KRX", # KRX 시세
-            "aly_qut_cd": "1"   # 1: 정규장 (필수 파라미터)
-        }
-        data = self._post("/krstock/inquiry/v1/assetStatus", payload)
-        out0 = data.get("Output_0") or {}
-        out1 = data.get("Output_1") or []
-
-        total_asset = float(out0.get("nas_amt", 0) or 0)
-        holdings = {}
-        for item in out1:
-            code = item.get("iem_cd")
-            if code:
-                holdings[code] = {
-                    "name": item.get("iem_nm"),
-                    "qty": int(item.get("itg_bnc_qty", 0)),
-                    "avg_price": float(item.get("phs_pr", 0)),
-                    "now_price": float(item.get("now_pr", 0))
-                }
-
-        return {"total_asset": total_asset, "holdings": holdings}
-
-    def order_cash_buy(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매수 주문 (/krstock/order/v1/cashBuy) - orr_pr 필드 생략 필수"""
-        if qty <= 0:
+            logger.error(f"[매수 주문 거절/실패]: {e}")
             return False
 
-        payload = {
-            "act_no": self.act_no,
-            "iem_cd": symbol,
-            "orr_qty": str(qty),
-            "nmn_pr_tp_cd": "05",       # 05: 시장가
-            "orr_cnd_dit_cd": "00",     # 00: 없음
-            "ssl_nmn_pr_dit_cd": "00", # 00: 정상
-            "rmt_mkt_cd": "KRX",
-            "sor_mkt_sli_yn": "N"
-        }
-        data = self._post("/krstock/order/v1/cashBuy", payload)
-        out0 = data.get("Output_0") or {}
-        order_no = out0.get("mkt_orr_no")
-        if not order_no:
-            logger.error(f"[매수 실패] {data.get('rsp_msg')}")
-            return False
-        return True
-
-    def order_cash_sell(self, symbol: str, qty: int) -> bool:
-        """시장가 현금 매도 주문 (/krstock/order/v1/cashSell) - orr_pr 필드 생략 필수"""
-        if qty <= 0:
-            return False
+    def order_cash_sell(self, ticker, qty, price=0):
+        """나무증권 KRX 시장가 현금 매도"""
+        act_no = str(self.account_no).replace("-", "").strip()
+        is_market = (price == 0)
 
         payload = {
-            "act_no": self.act_no,
-            "iem_cd": symbol,
-            "orr_qty": str(qty),
-            "nmn_pr_tp_cd": "05",       # 05: 시장가
-            "orr_cnd_dit_cd": "00",     # 00: 없음
-            "ssl_nmn_pr_dit_cd": "00", # 00: 정상
-            "rmt_mkt_cd": "KRX",
-            "sor_mkt_sli_yn": "N"
+            "Input_0": {
+                "act_no": act_no,
+                "iem_cd": str(ticker).replace("A", "").strip(),
+                "orr_qty": int(qty),
+                "orr_pr": 0 if is_market else int(price),
+                "nmn_pr_tp_cd": "05" if is_market else "01",
+                "orr_cnd_dit_cd": "00",
+                "ssl_nmn_pr_dit_cd": "00",
+                "rmt_mkt_cd": "KRX",
+                "sor_mkt_sli_yn": "N"
+            }
         }
-        data = self._post("/krstock/order/v1/cashSell", payload)
-        out0 = data.get("Output_0") or {}
-        order_no = out0.get("mkt_orr_no")
-        if not order_no:
-            logger.error(f"[매도 실패] {data.get('rsp_msg')}")
+        try:
+            data = self._post("/krstock/order/v1/cashSell", payload)
+            rsp_msg = data.get("rsp_msg", "")
+            logger.info(f"[매도 접수 성공] {ticker} {qty}주 | {rsp_msg}")
+            return True
+        except Exception as e:
+            logger.error(f"[매도 주문 거절/실패]: {e}")
             return False
-        return True
