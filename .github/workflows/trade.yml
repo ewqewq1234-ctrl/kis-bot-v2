@@ -45,6 +45,5 @@ jobs:
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           if [ -f state.json ]; then
             git add state.json
-            git diff-index --quiet HEAD || git commit -m "Auto: Update state.json [skip ci]"
-            git push origin HEAD || true
-          fi
+            git diff --quiet state.json || git commit -m "Auto: Update state.json [skip ci]"
+          git push origin HEAD || true
