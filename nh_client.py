@@ -66,7 +66,7 @@ class NHClient:
             "grant_type": "client_credentials",
             "scope": "oob"
         }
-        res = self.session.post(url, headers=headers, data=data, timeout=10)
+        res = self.session.post(url, headers=headers, data=data, timeout=20)
         res.raise_for_status()
         token_info = res.json()
         self.access_token = token_info.get("access_token")
