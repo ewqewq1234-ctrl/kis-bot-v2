@@ -1,103 +1,27 @@
 import os
 import json
 import logging
-import requests
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
 from datetime import datetime, timezone, timedelta
+from nhplug import call, NhplugError, status_of
 
 logger = logging.getLogger("NHClient")
 
 class NHClient:
-    # BASE_URL 정의 (나무증권 실거래 게이트웨이)
-    BASE_URL = "https://api.nhplug.com:8443"
-
-    def __init__(self, app_key=None, app_secret=None, account_no=None):
-        self.app_key = app_key or os.getenv("NH_APP_KEY")
-        self.app_secret = app_secret or os.getenv("NH_APP_SECRET")
+    def __init__(self, account_no=None):
         self.account_no = account_no or os.getenv("NH_ACCOUNT_NO")
-        self.token_file = "tokens.json"
-        self.access_token = None
 
-        self.session = requests.Session()
-        retries = Retry(
-            total=3,
-            backoff_factor=1,
-            status_forcelist=[500, 502, 503, 504],
-            raise_on_status=False
-        )
-        adapter = HTTPAdapter(max_retries=retries)
-        self.session.mount("https://", adapter)
-        self.session.mount("http://", adapter)
-
-        self._load_or_refresh_token()
-
-    def _get_auth_headers(self):
-        return {
-            "Content-Type": "application/json; charset=utf-8",
-            "Authorization": f"Bearer {self.access_token}",
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "cts": "",
-            "cts_flag": ""
-        }
-
-    def _load_or_refresh_token(self):
-        kst = timezone(timedelta(hours=9))
-        today_str = datetime.now(kst).strftime("%Y-%m-%d")
-
-        if os.path.exists(self.token_file):
-            try:
-                with open(self.token_file, "r", encoding="utf-8") as f:
-                    data = json.load(f)
-                    if data.get("issued_date") == today_str:
-                        self.access_token = data.get("access_token")
-                        return
-            except Exception:
-                pass
-        self._issue_token()
-
-    def _issue_token(self):
-        url = f"{self.BASE_URL}/oauth2/token"
-        headers = {"Content-Type": "application/x-www-form-urlencoded"}
-        data = {
-            "appkey": self.app_key,
-            "appsecretkey": self.app_secret,
-            "grant_type": "client_credentials",
-            "scope": "oob"
-        }
-        res = self.session.post(url, headers=headers, data=data, timeout=10)
-        res.raise_for_status()
-        token_info = res.json()
-        self.access_token = token_info.get("access_token")
-
-        kst = timezone(timedelta(hours=9))
-        today_str = datetime.now(kst).strftime("%Y-%m-%d")
-        with open(self.token_file, "w", encoding="utf-8") as f:
-            json.dump({"access_token": self.access_token, "issued_date": today_str}, f)
-
-    def _post(self, path, payload):
-        url = f"{self.BASE_URL}{path}"
-        headers = self._get_auth_headers()
-        res = self.session.post(url, headers=headers, json=payload, timeout=(10, 20))
-        
-        # 상세 거절 원인 확인을 위한 본문 로깅
-        if res.status_code != 200:
-            logger.error(f"[API 호출 오류] {path} | HTTP {res.status_code} | 본문: {res.text}")
-            res.raise_for_status()
-            
-        return res.json()
+    def _get_act_no(self):
+        """계좌번호 정제 (하이픈 제거)"""
+        return str(self.account_no).replace("-", "").strip()
 
     def get_current_price(self, ticker="069500"):
-        payload = {
-            "Input_0": {
+        """현재가 조회 (SDK 규격: view_main_yn='Y' 필수)"""
+        try:
+            data = call("/krstock/quote/v1/currentExecution", {
                 "market_cd": "KRX",
                 "iem_cd": str(ticker).replace("A", "").strip(),
-                "view_main_yn": "N"
-            }
-        }
-        try:
-            data = self._post("/krstock/quote/v1/currentExecution", payload)
+                "view_main_yn": "Y"
+            })
             out_1 = data.get("Output_1") or {}
             price = out_1.get("stck_prpr")
             return float(str(price).replace(",", "").strip()) if price else 0.0
@@ -106,18 +30,15 @@ class NHClient:
             return 0.0
 
     def get_asset_status(self):
-        act_no = str(self.account_no).replace("-", "").strip()
-        payload = {
-            "Input_0": {
-                "act_no": act_no,
+        """자산 및 잔고 조회 (SDK 규격: aly_qut_cd='2' 필수)"""
+        try:
+            data = call("/krstock/inquiry/v1/assetStatus", {
+                "act_no": self._get_act_no(),
                 "eal_aly_cd": "2",
                 "aet_bse": "1",
                 "qut_dit_cd": "UNT",
                 "aly_qut_cd": "2"
-            }
-        }
-        try:
-            data = self._post("/krstock/inquiry/v1/assetStatus", payload)
+            })
             out_0 = data.get("Output_0") or {}
             total_asset = float(out_0.get("nas_amt") or out_0.get("tot_aet_amt") or 0.0)
 
@@ -134,14 +55,12 @@ class NHClient:
             logger.error(f"자산 조회 예외: {e}")
             return {"total_asset": 0.0, "holdings": {}}
 
-    def order_cash_buy(self, ticker, qty, price=0):
-        """나무증권 현금 매수 (규약 준수 및 거절 메시지 판정)"""
-        act_no = str(self.account_no).replace("-", "").strip()
+    def order_cash_buy_with_reason(self, ticker, qty, price=0):
+        """현금 매수 (시장가 '05', orr_pr: 0, rsp_msg 기반 성공/실패 판정)"""
         is_market = (price == 0)
-
         payload = {
             "Input_0": {
-                "act_no": act_no,
+                "act_no": self._get_act_no(),
                 "iem_cd": str(ticker).replace("A", "").strip(),
                 "orr_qty": int(qty),
                 "orr_pr": 0 if is_market else int(price),
@@ -153,28 +72,31 @@ class NHClient:
             }
         }
         try:
-            data = self._post("/krstock/order/v1/cashBuy", payload)
-            rsp_msg = data.get("rsp_msg", "")
+            data = call("/krstock/order/v1/cashBuy", payload)
+            rsp_cd, rsp_msg = status_of(data)
             
-            # HTTP 200이어도 rsp_msg에 거절/종료 메시지가 있으면 실패 처리
-            if any(k in rsp_msg for k in ["종료", "불가", "오류", "거절", "한도초과", "잔고부족"]):
-                logger.warning(f"[주문 거절/미접수] {ticker} {qty}주 | 사유: {rsp_msg}")
-                return False
+            # 증권사 거절 키워드 탐지
+            if any(k in rsp_msg for k in ["종료", "불가", "오류", "거절", "한도초과", "잔고부족", "증거금부족"]):
+                logger.warning(f"[주문 거절] {ticker} {qty}주 | 사유: {rsp_msg}")
+                return False, rsp_msg
 
             logger.info(f"[주문 접수 완료] {ticker} {qty}주 | {rsp_msg}")
-            return True
+            return True, rsp_msg
+        except NhplugError as ne:
+            err_str = f"API 오류 (HTTP {ne.status_code}): {ne.raw}"
+            logger.error(f"[주문 예외]: {err_str}")
+            return False, err_str
         except Exception as e:
-            logger.error(f"[주문 전송 예외]: {e}")
-            return False
+            err_str = str(e)
+            logger.error(f"[주문 전송 예외]: {err_str}")
+            return False, err_str
 
-    def order_cash_sell(self, ticker, qty, price=0):
-        """나무증권 KRX 시장가 현금 매도"""
-        act_no = str(self.account_no).replace("-", "").strip()
+    def order_cash_sell_with_reason(self, ticker, qty, price=0):
+        """현금 매도 (시장가 '05', orr_pr: 0)"""
         is_market = (price == 0)
-
         payload = {
             "Input_0": {
-                "act_no": act_no,
+                "act_no": self._get_act_no(),
                 "iem_cd": str(ticker).replace("A", "").strip(),
                 "orr_qty": int(qty),
                 "orr_pr": 0 if is_market else int(price),
@@ -186,10 +108,16 @@ class NHClient:
             }
         }
         try:
-            data = self._post("/krstock/order/v1/cashSell", payload)
-            rsp_msg = data.get("rsp_msg", "")
-            logger.info(f"[매도 접수 성공] {ticker} {qty}주 | {rsp_msg}")
-            return True
+            data = call("/krstock/order/v1/cashSell", payload)
+            rsp_cd, rsp_msg = status_of(data)
+            
+            if any(k in rsp_msg for k in ["종료", "불가", "오류", "거절", "한도초과", "잔고부족", "증거금부족"]):
+                logger.warning(f"[매도 거절] {ticker} {qty}주 | 사유: {rsp_msg}")
+                return False, rsp_msg
+
+            logger.info(f"[매도 접수 완료] {ticker} {qty}주 | {rsp_msg}")
+            return True, rsp_msg
         except Exception as e:
-            logger.error(f"[매도 주문 거절/실패]: {e}")
-            return False
+            err_str = str(e)
+            logger.error(f"[매도 전송 예외]: {err_str}")
+            return False, err_str
