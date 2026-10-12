@@ -73,14 +73,14 @@ def run_strategy():
     client = NHClient()
     state = load_state()
 
-    # 1. 실제 자산 및 잔고 동기화 (SDK 규칙 준수: aly_qut_cd="2")
+    # 1. 실제 자산 및 잔고 동기화
     asset_info = client.get_asset_status()
     total_asset = float(asset_info.get("total_asset", 0))
     holding_data = asset_info.get("holdings", {}).get(SYMBOL, {})
     holding_qty = int(holding_data.get("qty", 0))
     account_avg_price = float(holding_data.get("avg_price", 0))
 
-    # 2. 실시간 시세 조회 (SDK 규칙 준수: view_main_yn="Y")
+    # 2. 실시간 시세 조회
     current_price = client.get_current_price(SYMBOL)
     if current_price is None or current_price <= 0:
         logger.error("시세 조회 실패로 이번 루틴을 안전하게 중단합니다.")
@@ -132,9 +132,7 @@ def run_strategy():
     )
     current_step = state.get("current_step", 0)
 
-    # -------------------------------------------------------------------------
-    # [정규장 시간 가드] 09:05 ~ 15:20 사이에만 신규 주문 전송 허용
-    # -------------------------------------------------------------------------
+    # 정규장 시간 가드
     is_market_open = (
         (now_kst.hour == 9 and now_kst.minute >= 5) or 
         (10 <= now_kst.hour < 15) or 
@@ -143,7 +141,6 @@ def run_strategy():
 
     if not is_market_open:
         logger.info(f"[정규장 마감 시간] 현재 시각({now_kst.strftime('%H:%M')})은 매매 시간 외이므로 주문 집행을 생략합니다.")
-        # 장 마감 브리핑 (15:00 ~ 15:30) 수행
         if now_kst.hour == 15 and now_kst.minute < 30:
             unrealized_pct = ((current_price / effective_avg) - 1) * 100 if holding_qty > 0 else 0.0
             send_telegram(
@@ -158,9 +155,7 @@ def run_strategy():
         save_state(state)
         return
 
-    # -------------------------------------------------------------------------
-    # [조건 1] 포지션 미보유 시: 1단계 신규 진입 (10% 비중)
-    # -------------------------------------------------------------------------
+    # [조건 1] 포지션 미보유 시: 1단계 신규 진입
     if current_step == 0:
         allocated_budget = total_asset * WEIGHTS[0]
         order_qty = int(allocated_budget // current_price)
@@ -192,21 +187,17 @@ def run_strategy():
                 )
         return
 
-    # -------------------------------------------------------------------------
     # [조건 2] 청산 매트릭스 판정
-    # -------------------------------------------------------------------------
     if current_step in [1, 2]:
         ts_trigger_price = effective_avg * (1 + TS_TRIGGER_RATE)
 
         if not state.get("trailing_mode", False) and current_price >= ts_trigger_price:
-            logger.info(f"★ [트레일링 모드 가동] 평단(+2.0%) 돌파: 현재가 {current_price:,}원")
             state["trailing_mode"] = True
             state["highest_price"] = current_price
             save_state(state)
             send_telegram(
                 f"🎯 <b>[KODEX 200] 트레일링 스탑 가동</b>\n"
-                f"• 현재가: {current_price:,}원 (평단 대비 +2.0% 돌파)\n"
-                f"• 고점 대비 -1.0% 반락 시 익절 집행"
+                f"• 현재가: {current_price:,}원 (평단 대비 +2.0% 돌파)"
             )
 
         if state.get("trailing_mode", False):
@@ -216,7 +207,6 @@ def run_strategy():
 
             ts_stop_price = state["highest_price"] * (1 - TS_FALLBACK_RATE)
             if current_price <= ts_stop_price:
-                logger.info(f"★ [트레일링 익절 조건 충족] 전량 매도 시도")
                 success, reason = client.order_cash_sell_with_reason(SYMBOL, holding_qty)
                 if success:
                     profit_pct = ((current_price / effective_avg) - 1) * 100
@@ -239,13 +229,11 @@ def run_strategy():
     elif current_step in [3, 4]:
         escape_price = effective_avg * (1 + ESCAPE_PROFIT_RATE)
         if current_price >= escape_price:
-            logger.info(f"★ [비상 본전 탈출 충족] 전량 청산 시도")
             success, reason = client.order_cash_sell_with_reason(SYMBOL, holding_qty)
             if success:
                 send_telegram(
                     f"🛡️ <b>[KODEX 200] 비상 본전 탈출 체결 (무손실)</b>\n"
-                    f"• 탈출단계: {current_step}단계 | 평단가: {effective_avg:,.1f}원\n"
-                    f"• 매도단가: {current_price:,}원 | 수량: {holding_qty:,}주"
+                    f"• 탈출단계: {current_step}단계 | 매도단가: {current_price:,}원"
                 )
                 state["current_step"] = 0
                 state["current_stage"] = 0
@@ -258,9 +246,7 @@ def run_strategy():
                 send_telegram(f"🚨 <b>[KODEX 200] 탈출 매도 주문 거절 경고</b>\n• 사유: <code>{reason}</code>")
             return
 
-    # -------------------------------------------------------------------------
     # [조건 3] 단계별 추가 분할 매수 판정 (-2.8% 하락 시)
-    # -------------------------------------------------------------------------
     if current_step < 4 and state.get("entry_prices"):
         last_price = state["entry_prices"][-1]
         next_trigger_price = last_price * (1 - STEP_DROP_RATE)
@@ -287,7 +273,7 @@ def run_strategy():
                         f"• 투입비중: {WEIGHTS[next_step - 1] * 100:.0f}% ({allocated_budget:,.0f}원)"
                     )
                 else:
-                    # 예수금 부족 등 거절 시 텔레그램 경고 발송
+                    # 🔴 예수금 부족 등 거절 시 텔레그램 경고 발송
                     send_telegram(
                         f"🚨 <b>[KODEX 200] {next_step}단계 주문 거절 경고</b>\n"
                         f"• 시도 수량: {order_qty:,}주 (현재가 {current_price:,}원)\n"
