@@ -46,4 +46,5 @@ jobs:
           if [ -f state.json ]; then
             git add state.json
             git diff --quiet state.json || git commit -m "Auto: Update state.json [skip ci]"
-          git push origin HEAD || true
+            git push origin HEAD || true
+          fi
