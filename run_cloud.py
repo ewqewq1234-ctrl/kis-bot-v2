@@ -247,7 +247,9 @@ def run_strategy():
             return
 
     # [조건 3] 단계별 추가 분할 매수 판정 (-2.8% 하락 시)
-    if current_step < 4 and state.get("entry_prices"):
+    # [조건 3] 단계별 추가 분할 매수 판정 (-2.8% 하락 시)
+    # 🔴 이미 4단계이거나 보유 수량이 32주 이상(풀포지션)이면 추가 매수를 원천 차단
+    if current_step < 4 and holding_qty < 32 and state.get("entry_prices"):
         last_price = state["entry_prices"][-1]
         next_trigger_price = last_price * (1 - STEP_DROP_RATE)
 
