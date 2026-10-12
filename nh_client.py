@@ -5,6 +5,7 @@ from datetime import datetime, timezone, timedelta
 import requests
 from requests.adapters import HTTPAdapter
 from urllib3.util.retry import Retry
+from nhplug import call, NhplugError, status_of
 
 logger = logging.getLogger("NHClient")
 
@@ -130,16 +131,24 @@ class NHClient:
             logger.error(f"자산 조회 예외: {e}")
             return {"total_asset": 0.0, "holdings": {}}
 
-    def order_cash_buy_limit_with_reason(self, ticker, qty, price):
-        """현금 지정가 매수 (증거금 할증 회피 목적)"""
+    def order_cash_buy_with_reason(self, ticker, qty, price=0):
+        """현금 지정가/시장가 매수 (증거금 할증 회피 지정가 전환 반영)"""
         act_no = str(self.account_no).replace("-", "").strip()
+        
+        # price가 0이면 현재가 조회 후 지정가(01) 가격으로 활용하여 증거금 초과 할증 회피
+        if price == 0:
+            current_price = self.get_current_price(ticker)
+            order_price = int(current_price) if current_price > 0 else 0
+        else:
+            order_price = int(price)
+
         payload = {
             "Input_0": {
                 "act_no": act_no,
                 "iem_cd": str(ticker).replace("A", "").strip(),
                 "orr_qty": int(qty),
-                "orr_pr": int(price),          # 현재가 등 원 단위 정수 가격 지정
-                "nmn_pr_tp_cd": "01",          # 지정가 01
+                "orr_pr": order_price,
+                "nmn_pr_tp_cd": "01",  # 지정가 01
                 "orr_cnd_dit_cd": "00",
                 "ssl_nmn_pr_dit_cd": "00",
                 "rmt_mkt_cd": "KRX",
@@ -150,10 +159,14 @@ class NHClient:
             data = call("/krstock/order/v1/cashBuy", payload)
             rsp_cd, rsp_msg = status_of(data)
             if any(k in rsp_msg for k in ["종료", "불가", "오류", "거절", "한도초과", "잔고부족", "증거금부족"]):
+                logger.warning(f"[주문 거절] {ticker} {qty}주 | 사유: {rsp_msg}")
                 return False, rsp_msg
+            logger.info(f"[주문 접수 완료] {ticker} {qty}주 | {rsp_msg}")
             return True, rsp_msg
         except Exception as e:
-            return False, str(e)
+            err_str = str(e)
+            logger.error(f"[주문 전송 예외]: {err_str}")
+            return False, err_str
 
     def order_cash_sell_with_reason(self, ticker, qty, price=0):
         act_no = str(self.account_no).replace("-", "").strip()
