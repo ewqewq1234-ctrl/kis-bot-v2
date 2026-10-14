@@ -1,2 +1,2 @@
-requests
-nhplug
+requests>=2.31,<3
+nhplug>=0.4,<1

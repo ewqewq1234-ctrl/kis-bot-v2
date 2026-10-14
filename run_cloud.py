@@ -1,9 +1,17 @@
-import os
+"""KODEX 200 전략 B (실거래 보호 개정판)
+
+1~4단계 10/20/30/40%, -2.8% 분할매수 및 기존 청산비율 유지.
+주문 접수와 체결을 분리하고 실제 잔고가 확인되기 전에는 신규 주문을 막는다.
+"""
+import html
 import json
 import logging
-from datetime import datetime, timezone, timedelta
+import os
+import tempfile
+from datetime import datetime, timedelta, timezone
+
 import requests
-from nh_client import NHClient
+from nh_client import NHClient, NHClientError
 
 KST = timezone(timedelta(hours=9))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
@@ -11,282 +19,259 @@ logger = logging.getLogger("StrategyB_Cloud")
 
 STATE_FILE = "state.json"
 SYMBOL = "069500"  # KODEX 200
+MAX_SHARES = 32  # 사용자 실계좌 보유 상한 (증액 전 재검토 필요)
+WEIGHTS = [0.10, 0.20, 0.30, 0.40]
+STEP_DROP_RATE = 0.028
+TS_TRIGGER_RATE = 0.020
+TS_FALLBACK_RATE = 0.010
+ESCAPE_PROFIT_RATE = 0.0005
 
-# [B 전략] 핵심 매트릭스 파라미터
-WEIGHTS = [0.10, 0.20, 0.30, 0.40]   # 4단계 비대칭 자본금 비중
-STEP_DROP_RATE = 0.028                # 단계별 -2.8% 하락 시 추가 매수
-TS_TRIGGER_RATE = 0.020               # 1~2단계: 평단 대비 +2.0% 도달 시 TS 모드 가동
-TS_FALLBACK_RATE = 0.010              # 1~2단계: 최고가 대비 -1.0% 반락 시 익절
-ESCAPE_PROFIT_RATE = 0.0005           # 3~4단계: 평단 대비 +0.05% 도달 시 본전 탈출 (제비용 회수)
+
+class SafetyHalt(RuntimeError):
+    """불확실한 계좌·주문 상태로 인한 거래 차단."""
 
 
-def send_telegram(message: str) -> None:
-    token = os.getenv("TELEGRAM_BOT_TOKEN")
-    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+def send_telegram(message):
+    token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
-        logger.info(f"[Telegram 미설정] {message}")
+        logger.info("[Telegram 미설정] %s", message)
         return
     try:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": message, "parse_mode": "HTML"}
-        requests.post(url, json=payload, timeout=5)
-    except Exception as e:
-        logger.error(f"텔레그램 전송 실패: {e}")
+        response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
+                                 json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=5)
+        response.raise_for_status()
+    except requests.RequestException as exc:
+        logger.warning("Telegram 전송 실패: %s", exc)
 
 
-def load_state() -> dict:
-    default_state = {
-        "symbol": SYMBOL,
-        "current_stage": 0,
-        "current_step": 0,
-        "shares": 0,
-        "avg_price": 0.0,
-        "last_buy_price": 0.0,
-        "entry_prices": [],
-        "trailing_mode": False,
-        "highest_price": 0,
-        "last_run": ""
+def default_state():
+    return {"symbol": SYMBOL, "current_stage": 0, "current_step": 0,
+            "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
+            "entry_prices": [], "trailing_mode": False, "highest_price": 0,
+            "pending_order": None, "last_run": ""}
+
+
+def load_state():
+    result = default_state()
+    if not os.path.exists(STATE_FILE):
+        # 기존 기록이 없어졌을 때 임의로 0주라고 가정하지 않고 실제 계좌로 검증한다.
+        return result
+    try:
+        with open(STATE_FILE, encoding="utf-8") as file:
+            saved = json.load(file)
+        if not isinstance(saved, dict) or saved.get("symbol", SYMBOL) != SYMBOL:
+            raise ValueError("상태 형식/종목 불일치")
+        result.update(saved)  # 기존 누적손익 필드는 보존
+        return result
+    except (OSError, ValueError, TypeError) as exc:
+        raise SafetyHalt(f"상태파일 해석 불가 — 임의 초기화 금지: {exc}") from exc
+
+
+def save_state(state):
+    path = os.path.abspath(STATE_FILE)
+    directory = os.path.dirname(path)
+    fd, temp = tempfile.mkstemp(dir=directory, prefix=".state-", suffix=".tmp")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as file:
+            json.dump(state, file, ensure_ascii=False, indent=2)
+            file.flush()
+            os.fsync(file.fileno())
+        os.replace(temp, path)
+    finally:
+        if os.path.exists(temp):
+            os.unlink(temp)
+
+
+def reset_position(state):
+    state.update({"current_stage": 0, "current_step": 0, "shares": 0,
+                  "avg_price": 0.0, "last_buy_price": 0.0, "entry_prices": [],
+                  "trailing_mode": False, "highest_price": 0, "pending_order": None})
+
+
+def reconcile_pending(state, actual_qty, actual_avg):
+    """접수한 주문은 현재 보유수량으로 완전체결이 검증된 후에만 단계 확정."""
+    pending = state.get("pending_order")
+    if not pending:
+        return
+    before, wanted = int(pending["before_qty"]), int(pending["qty"])
+    side, target_step = pending["side"], int(pending["target_step"])
+    expected = before + wanted if side == "buy" else before - wanted
+    if actual_qty != expected:
+        raise SafetyHalt(
+            f"주문 체결 불확실: {side} {wanted}주, 접수 전 {before}주, "
+            f"체결 후 예상 {expected}주 / 실제 {actual_qty}주. 미체결·부분체결 수동 확인 필요"
+        )
+    if side == "sell":
+        if actual_qty != 0:
+            raise SafetyHalt("매도 완료 수량 검증 실패")
+        reset_position(state)
+    else:
+        old_avg = float(pending["before_avg"])
+        estimated_price = (actual_qty * actual_avg - before * old_avg) / wanted
+        if estimated_price <= 0:
+            raise SafetyHalt("매수 체결단가 역산 실패")
+        if target_step == 1:
+            state["entry_prices"] = [estimated_price]
+        else:
+            if len(state.get("entry_prices", [])) != target_step - 1:
+                raise SafetyHalt("단계별 기존 매수가 기록 불일치")
+            state["entry_prices"].append(estimated_price)
+        state.update({"current_step": target_step, "current_stage": target_step,
+                      "shares": actual_qty, "avg_price": actual_avg,
+                      "last_buy_price": estimated_price, "trailing_mode": False,
+                      "highest_price": 0, "pending_order": None})
+    save_state(state)
+    send_telegram(f"✅ <b>실잔고 체결 확인</b> / 현재 {actual_qty}주, 단계 {state['current_step']}/4")
+
+
+def reconcile_existing(state, actual_qty, actual_avg):
+    """기존 버전 3단계(17주) -> 실잔고 4단계(32주) 복구만 허용한다."""
+    if actual_qty > MAX_SHARES:
+        raise SafetyHalt(f"보유 {actual_qty}주가 상한 {MAX_SHARES}주를 초과. 자동 주문 중단")
+    stage, recorded_qty = int(state.get("current_step", 0)), int(state.get("shares", 0))
+    if actual_qty == MAX_SHARES:
+        if stage != 4 or recorded_qty != actual_qty:
+            logger.warning("[상태 복구] 저장 %d주/%d단계 -> 실계좌 %d주/4단계", recorded_qty, stage, actual_qty)
+            # 4단계에서는 직전 매수가에 기반한 추가매수가 없으므로 추정가격을 생성하지 않는다.
+            state.update({"current_step": 4, "current_stage": 4, "shares": actual_qty,
+                          "avg_price": actual_avg, "trailing_mode": False,
+                          "highest_price": 0})
+            save_state(state)
+            send_telegram(f"🛡️ <b>4단계 상태 복구</b>: 실계좌 {actual_qty}주, 평단 {actual_avg:,.1f}원")
+        else:
+            state["avg_price"] = actual_avg
+        return
+    if actual_qty == 0:
+        if stage != 0 or recorded_qty != 0:
+            reset_position(state)
+            save_state(state)
+        return
+    if stage not in (1, 2, 3) or recorded_qty != actual_qty:
+        raise SafetyHalt(f"저장 상태 {recorded_qty}주/{stage}단계 ↔ 실계좌 {actual_qty}주 불일치")
+    if len(state.get("entry_prices", [])) != stage:
+        raise SafetyHalt("분할매수 기록 개수와 매매 단계 불일치")
+    state["avg_price"] = actual_avg
+
+
+def market_open(now):
+    return (now.weekday() < 5 and
+            ((now.hour == 9 and now.minute >= 5) or (10 <= now.hour < 15) or
+             (now.hour == 15 and now.minute <= 20)))
+
+
+def place_order(client, state, side, qty, quote, target_step, before_qty, before_avg, now):
+    if qty <= 0 or (side == "buy" and before_qty + qty > MAX_SHARES):
+        raise SafetyHalt("최대 보유수량을 초과하거나 주문수량이 0 이하")
+    # 실주문 실행은 운영자의 명시적 환경변수 설정이 필요하다.
+    if os.getenv("ENABLE_LIVE_ORDERS", "NO").upper() != "YES":
+        logger.warning("[DRY RUN] 실제 주문 비활성: %s %d주", side, qty)
+        send_telegram(f"🧪 <b>주문 미실행(DRY RUN)</b> {html.escape(side)} {qty}주")
+        return
+    state["pending_order"] = {
+        "side": side, "qty": qty, "target_step": target_step,
+        "before_qty": before_qty, "before_avg": before_avg,
+        "requested_price": quote, "created_at": now.isoformat(),
+        "order_no": None, "status": "submitting"
     }
-    if os.path.exists(STATE_FILE):
-        try:
-            with open(STATE_FILE, "r", encoding="utf-8") as f:
-                loaded = json.load(f)
-                if isinstance(loaded, dict):
-                    for k, v in default_state.items():
-                        if k not in loaded:
-                            loaded[k] = v
-                    return loaded
-        except Exception as e:
-            logger.warning(f"state.json 로드 실패, 기본값으로 초기화: {e}")
-    return default_state
-
-
-def save_state(state: dict) -> None:
-    with open(STATE_FILE, "w", encoding="utf-8") as f:
-        json.dump(state, f, indent=2, ensure_ascii=False)
+    save_state(state)  # 예외/응답 유실 시에는 다음 실행에서 새 주문을 막는다.
+    receipt = client.submit_order(SYMBOL, qty, side, price=quote if side == "buy" else 0)
+    state["pending_order"].update({"order_no": receipt["order_no"], "status": "accepted"})
+    save_state(state)
+    send_telegram(f"📨 <b>주문 접수(체결 미확인)</b> {html.escape(side)} {qty}주 / "
+                  f"접수번호 {html.escape(receipt['order_no'])}")
 
 
 def run_strategy():
-    now_kst = datetime.now(KST)
-    logger.info(f"=== B 전략 엔진 가동 ({now_kst.strftime('%Y-%m-%d %H:%M:%S')} KST) ===")
-
+    now = datetime.now(KST)
+    logger.info("=== 전략 B %s KST ===", now.strftime("%Y-%m-%d %H:%M:%S"))
     client = NHClient()
     state = load_state()
+    assets = client.get_asset_status()
+    current = assets["holdings"].get(SYMBOL, {})
+    qty, avg = int(current.get("qty", 0)), float(current.get("avg_price", 0))
+    quote = client.get_current_price(SYMBOL)
+    logger.info("실계좌 %d주 / 평단 %.2f / 현재가 %d / 총자산 %.0f", qty, avg, quote, assets["total_asset"])
+    if qty and avg <= 0:
+        raise SafetyHalt("실계좌 평균매수가 누락")
+    if qty > MAX_SHARES:
+        raise SafetyHalt("계좌 보유량이 설정 상한 초과")
 
-    # 1. 실제 자산 및 잔고 동기화
-    asset_info = client.get_asset_status()
-    total_asset = float(asset_info.get("total_asset", 0))
-    holding_data = asset_info.get("holdings", {}).get(SYMBOL, {})
-    holding_qty = int(holding_data.get("qty", 0))
-    account_avg_price = float(holding_data.get("avg_price", 0))
-
-    # 2. 실시간 시세 조회
-    current_price = client.get_current_price(SYMBOL)
-    if current_price is None or current_price <= 0:
-        logger.error("시세 조회 실패로 이번 루틴을 안전하게 중단합니다.")
-        return
-
-    logger.info(
-        f"[*] 실계좌 데이터 동기화: 종목={SYMBOL}, 현재가={current_price:,}원, "
-        f"총자산={total_asset:,.0f}원, 보유수량={holding_qty:,}주, 평단가={account_avg_price:,.1f}원"
-    )
-
-    # 3. 자체 치유(Self-Healing) 로직 보정
-    current_step = state.get("current_step", 0)
-
-    if holding_qty == 0 and current_step > 0:
-        logger.info("[자체 치유] 증권사 잔고 0주 확인 -> state.json 포지션 리셋")
-        state["current_step"] = 0
-        state["current_stage"] = 0
-        state["shares"] = 0
-        state["entry_prices"] = []
-        state["trailing_mode"] = False
-        state["highest_price"] = 0
-        save_state(state)
-
-    elif holding_qty > 0 and current_step == 0:
-        rec_price = int(account_avg_price) if account_avg_price > 0 else current_price
-        if holding_qty >= 7:
-            logger.info(f"[자체 치유] 실제 잔고 {holding_qty}주 감지 -> 2단계 상태로 자동 복구")
-            state["current_step"] = 2
-            state["current_stage"] = 2
-            state["entry_prices"] = [rec_price, rec_price]
-        else:
-            logger.info(f"[자체 치유] 실제 잔고 {holding_qty}주 감지 -> 1단계 상태로 자동 복구")
-            state["current_step"] = 1
-            state["current_stage"] = 1
-            state["entry_prices"] = [rec_price]
-
-        state["shares"] = holding_qty
-        state["avg_price"] = rec_price
-        state["trailing_mode"] = False
-        state["highest_price"] = max(rec_price, current_price)
-        save_state(state)
-
-    state["shares"] = holding_qty
-    if account_avg_price > 0:
-        state["avg_price"] = account_avg_price
-
-    effective_avg = account_avg_price if account_avg_price > 0 else (
-        sum(state["entry_prices"]) / len(state["entry_prices"]) if state.get("entry_prices") else float(current_price)
-    )
-    current_step = state.get("current_step", 0)
-
-    # 정규장 시간 가드
-    is_market_open = (
-        (now_kst.hour == 9 and now_kst.minute >= 5) or 
-        (10 <= now_kst.hour < 15) or 
-        (now_kst.hour == 15 and now_kst.minute <= 20)
-    )
-
-    if not is_market_open:
-        logger.info(f"[정규장 마감 시간] 현재 시각({now_kst.strftime('%H:%M')})은 매매 시간 외이므로 주문 집행을 생략합니다.")
-        if now_kst.hour == 15 and now_kst.minute < 30:
-            unrealized_pct = ((current_price / effective_avg) - 1) * 100 if holding_qty > 0 else 0.0
-            send_telegram(
-                f"📊 <b>[KODEX 200] 정규장 마감 일일 결산</b>\n"
-                f"• 종가: {current_price:,}원\n"
-                f"• 포지션 단계: {current_step}/4단계\n"
-                f"• 보유 수량: {holding_qty:,}주\n"
-                f"• 평가 손익률: {unrealized_pct:+.2f}%\n"
-                f"• 트레일링 가동 여부: {state.get('trailing_mode', False)}"
-            )
-        state["last_run"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    # 장 외에는 주문조회 호출을 최소화하되, 오래된 pending 주문은 해제하지 않는다.
+    if not market_open(now):
+        if state.get("pending_order"):
+            logger.warning("미확인 주문이 남아 있습니다. 다음 장중 반드시 확인")
+        if now.hour == 15 and 21 <= now.minute < 50:
+            pnl = ((quote / avg) - 1) * 100 if qty else 0.0
+            send_telegram(f"📊 <b>KODEX 200 결산</b> / {qty}주 / 평단 {avg:,.1f}원 / "
+                          f"현재 {quote:,}원 / 평가손익률 {pnl:+.2f}%")
+        state["last_run"] = now.isoformat()
         save_state(state)
         return
 
-    # [조건 1] 포지션 미보유 시: 1단계 신규 진입
-    if current_step == 0:
-        allocated_budget = total_asset * WEIGHTS[0]
-        order_qty = int(allocated_budget // current_price)
-        if order_qty > 0:
-            logger.info(f"▶ [1단계 신규 진입] 예산: {allocated_budget:,.0f}원 -> 시장가 {order_qty:,}주 매수")
-            success, reason = client.order_cash_buy_with_reason(SYMBOL, order_qty)
-            if success:
-                state["current_step"] = 1
-                state["current_stage"] = 1
-                state["shares"] = order_qty
-                state["avg_price"] = current_price
-                state["last_buy_price"] = current_price
-                state["entry_prices"] = [current_price]
-                state["trailing_mode"] = False
-                state["highest_price"] = current_price
-                save_state(state)
-                send_telegram(
-                    f"🟢 <b>[KODEX 200] 1단계 진입 체결</b>\n"
-                    f"• 체결단가: {current_price:,}원\n"
-                    f"• 매수수량: {order_qty:,}주\n"
-                    f"• 투입비중: 10% ({allocated_budget:,.0f}원)"
-                )
-            else:
-                send_telegram(
-                    f"🚨 <b>[KODEX 200] 1단계 주문 거절 경고</b>\n"
-                    f"• 시도 수량: {order_qty:,}주\n"
-                    f"• 거절 사유: <code>{reason}</code>\n"
-                    f"• <b>계좌 예수금을 확인하세요!</b>"
-                )
-        return
+    orders = client.get_daily_orders(SYMBOL, now.strftime("%Y%m%d"))
+    outstanding = [o for o in orders if float(o["ny_cns_qty"]) > 0]
+    if outstanding:
+        raise SafetyHalt(f"오늘 KODEX 200 미체결 주문 {len(outstanding)}건 — 신규 주문 중단")
 
-    # [조건 2] 청산 매트릭스 판정
-    if current_step in [1, 2]:
-        ts_trigger_price = effective_avg * (1 + TS_TRIGGER_RATE)
-
-        if not state.get("trailing_mode", False) and current_price >= ts_trigger_price:
-            state["trailing_mode"] = True
-            state["highest_price"] = current_price
-            save_state(state)
-            send_telegram(
-                f"🎯 <b>[KODEX 200] 트레일링 스탑 가동</b>\n"
-                f"• 현재가: {current_price:,}원 (평단 대비 +2.0% 돌파)"
-            )
-
-        if state.get("trailing_mode", False):
-            if current_price > state.get("highest_price", 0):
-                state["highest_price"] = current_price
-                save_state(state)
-
-            ts_stop_price = state["highest_price"] * (1 - TS_FALLBACK_RATE)
-            if current_price <= ts_stop_price:
-                success, reason = client.order_cash_sell_with_reason(SYMBOL, holding_qty)
-                if success:
-                    profit_pct = ((current_price / effective_avg) - 1) * 100
-                    send_telegram(
-                        f"🎉 <b>[KODEX 200] 트레일링 익절 완료</b>\n"
-                        f"• 청산수량: {holding_qty:,}주 | 매도가격: {current_price:,}원\n"
-                        f"• 수익률: +{profit_pct:.2f}%"
-                    )
-                    state["current_step"] = 0
-                    state["current_stage"] = 0
-                    state["shares"] = 0
-                    state["entry_prices"] = []
-                    state["trailing_mode"] = False
-                    state["highest_price"] = 0
-                    save_state(state)
-                else:
-                    send_telegram(f"🚨 <b>[KODEX 200] 매도 주문 거절 경고</b>\n• 사유: <code>{reason}</code>")
-                return
-
-    elif current_step in [3, 4]:
-        escape_price = effective_avg * (1 + ESCAPE_PROFIT_RATE)
-        if current_price >= escape_price:
-            success, reason = client.order_cash_sell_with_reason(SYMBOL, holding_qty)
-            if success:
-                send_telegram(
-                    f"🛡️ <b>[KODEX 200] 비상 본전 탈출 체결 (무손실)</b>\n"
-                    f"• 탈출단계: {current_step}단계 | 매도단가: {current_price:,}원"
-                )
-                state["current_step"] = 0
-                state["current_stage"] = 0
-                state["shares"] = 0
-                state["entry_prices"] = []
-                state["trailing_mode"] = False
-                state["highest_price"] = 0
-                save_state(state)
-            else:
-                send_telegram(f"🚨 <b>[KODEX 200] 탈출 매도 주문 거절 경고</b>\n• 사유: <code>{reason}</code>")
-            return
-
-    # [조건 3] 단계별 추가 분할 매수 판정 (-2.8% 하락 시)
-    # [조건 3] 단계별 추가 분할 매수 판정 (-2.8% 하락 시)
-    # 🔴 이미 4단계이거나 보유 수량이 32주 이상(풀포지션)이면 추가 매수를 원천 차단
-    if current_step < 4 and holding_qty < 32 and state.get("entry_prices"):
-        last_price = state["entry_prices"][-1]
-        next_trigger_price = last_price * (1 - STEP_DROP_RATE)
-
-        if current_price <= next_trigger_price:
-            next_step = current_step + 1
-            allocated_budget = total_asset * WEIGHTS[next_step - 1]
-            order_qty = int(allocated_budget // current_price)
-
-            if order_qty > 0:
-                logger.info(f"▼ [{next_step}단계 물타기 진입] 현재가 {current_price:,}원 <= 기준가 {next_trigger_price:,.0f}원")
-                success, reason = client.order_cash_buy_with_reason(SYMBOL, order_qty)
-                
-                if success:
-                    state["current_step"] = next_step
-                    state["current_stage"] = next_step
-                    state["entry_prices"].append(current_price)
-                    state["trailing_mode"] = False
-                    state["highest_price"] = current_price
-                    save_state(state)
-                    send_telegram(
-                        f"⚠️ <b>[KODEX 200] {next_step}단계 추가 분할 매수 체결</b>\n"
-                        f"• 체결단가: {current_price:,}원 | 수량: {order_qty:,}주\n"
-                        f"• 투입비중: {WEIGHTS[next_step - 1] * 100:.0f}% ({allocated_budget:,.0f}원)"
-                    )
-                else:
-                    # 🔴 예수금 부족 등 거절 시 텔레그램 경고 발송
-                    send_telegram(
-                        f"🚨 <b>[KODEX 200] {next_step}단계 주문 거절 경고</b>\n"
-                        f"• 시도 수량: {order_qty:,}주 (현재가 {current_price:,}원)\n"
-                        f"• 거절 사유: <code>{reason}</code>\n"
-                        f"• <b>조치 필요: 계좌 예수금을 확인하세요!</b>"
-                    )
-            return
-
-    state["last_run"] = now_kst.strftime("%Y-%m-%d %H:%M:%S")
+    # 첫 주문 다음 번 실행까지 pending 유지. 체결 확인 후에만 다음 매매를 허용.
+    reconcile_pending(state, qty, avg)
+    if not state.get("pending_order"):
+        reconcile_existing(state, qty, avg)
+    stage = int(state["current_step"])
+    state["last_run"] = now.isoformat()
     save_state(state)
+
+    # 같은 날의 수동/자동 매매까지 포함하여 일일 중복·연속 주문을 차단한다.
+    if orders:
+        logger.info("오늘 주문 기록 %d건 존재: 중복 주문 방지 위해 거래 생략", len(orders))
+        return
+
+    if stage == 0:
+        target_step = 1
+        budget = assets["total_asset"] * WEIGHTS[0]
+        order_qty = int(budget // quote)
+        if order_qty > 0:
+            if assets["available_cash"] is None or assets["available_cash"] < order_qty * quote:
+                raise SafetyHalt("주문가능금액 부족/불명확 — 신규 매수 금지")
+            place_order(client, state, "buy", order_qty, quote, target_step, qty, avg, now)
+        return
+
+    if stage in (1, 2):
+        trigger = avg * (1 + TS_TRIGGER_RATE)
+        if not state.get("trailing_mode") and quote >= trigger:
+            state["trailing_mode"], state["highest_price"] = True, quote
+            save_state(state)
+        if state.get("trailing_mode"):
+            state["highest_price"] = max(quote, state["highest_price"])
+            save_state(state)
+            if quote <= state["highest_price"] * (1 - TS_FALLBACK_RATE):
+                place_order(client, state, "sell", qty, quote, 0, qty, avg, now)
+                return
+    elif stage in (3, 4) and quote >= avg * (1 + ESCAPE_PROFIT_RATE):
+        # +0.05%는 지정가격 트리거이며 순이익/무손실을 보장하지 않는다.
+        place_order(client, state, "sell", qty, quote, 0, qty, avg, now)
+        return
+
+    if stage >= 4 or qty >= MAX_SHARES:
+        logger.info("4단계/보유상한: 추가매수 금지")
+        return
+    last_buy = float(state["entry_prices"][-1])
+    if quote <= last_buy * (1 - STEP_DROP_RATE):
+        target_step = stage + 1
+        budget = assets["total_asset"] * WEIGHTS[target_step - 1]
+        order_qty = int(budget // quote)
+        if order_qty > 0:
+            if qty + order_qty > MAX_SHARES:
+                raise SafetyHalt(f"매수 예정 {order_qty}주 포함 {qty + order_qty}주 > 상한 {MAX_SHARES}주")
+            if assets["available_cash"] is None or assets["available_cash"] < order_qty * quote:
+                raise SafetyHalt("주문가능금액 부족/불명확 — 추가매수 금지")
+            place_order(client, state, "buy", order_qty, quote, target_step, qty, avg, now)
 
 
 if __name__ == "__main__":
-    run_strategy()
+    try:
+        run_strategy()
+    except (SafetyHalt, NHClientError, OSError, ValueError, KeyError, TypeError) as error:
+        logger.error("[거래 중단] %s", error, exc_info=True)
+        send_telegram(f"🚨 <b>자동매매 안전중단</b>\n{html.escape(str(error))}")
+        raise SystemExit(1)
