@@ -2,11 +2,14 @@ name: ETF Grid Trading Bot (Strategy B)
 
 on:
   schedule:
-    # 1. 정규장 매 정각 감시 (KST 09:00 ~ 15:00 -> UTC 00:00 ~ 06:00, 월~금)
     - cron: '0 0-6 * * 1-5'
-    # 2. 장 마감 일일 결산 브리핑 실행 (KST 15:35 -> UTC 06:35, 월~금)
     - cron: '35 6 * * 1-5'
   workflow_dispatch:
+
+# 일정·수동 실행 중첩으로 이중 주문하지 않도록 직렬화
+concurrency:
+  group: nh-strategy-b-production
+  cancel-in-progress: false
 
 permissions:
   contents: write
@@ -14,37 +17,52 @@ permissions:
 jobs:
   trade:
     runs-on: ubuntu-latest
+    timeout-minutes: 10
     steps:
       - name: 저장소 체크아웃
         uses: actions/checkout@v4
+        with:
+          persist-credentials: true
 
       - name: 파이썬 3.11 환경 설정
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
-      - name: 필수 라이브러리 설치
-        run: |
-          python -m pip install --upgrade pip
-          pip install requests
-          pip install requests nhplug
+      - name: 라이브러리 설치
+        run: pip install -r requirements.txt
 
-      - name: 봇 1회 체크 및 전략 B 실행
+      - name: 정적/단위 테스트
+        run: |
+          python -m compileall -q run_cloud.py nh_client.py
+          python -m unittest discover -s tests -v
+
+      - name: 전략 B 실행 (기본은 주문 비활성)
         env:
           NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
           NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
           NH_ACCOUNT_NO: ${{ secrets.NH_ACCOUNT_NO }}
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-        run: |
-          python run_cloud.py
+          ENABLE_LIVE_ORDERS: ${{ vars.ENABLE_LIVE_ORDERS || 'NO' }}
+        run: python run_cloud.py
 
-      - name: 전략 B 매매 상태(state.json) 깃 저장
+      # 전략이 안전중단/오류를 일으켜도 pending 상태를 보존해 재주문 차단
+      - name: 상태파일 변경 커밋
+        if: always()
+        shell: bash
         run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          if [ -f state.json ]; then
-            git add state.json
-            git diff --quiet state.json || git commit -m "Auto: Update state.json [skip ci]"
-            git push origin HEAD || true
+          set -euo pipefail
+          if [[ ! -f state.json ]]; then
+            echo 'state.json 없음 — 상태 영속화 실패'
+            exit 1
+          fi
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add state.json
+          if ! git diff --cached --quiet -- state.json; then
+            git commit -m 'Auto: Update state.json [skip ci]'
+            git push origin HEAD
+          else
+            echo '상태파일 변경사항 없음'
           fi
