@@ -85,6 +85,19 @@ class NHClient:
             raise NHClientError("현재가가 0 이하임 (주문 중단)")
         return int(price)
 
+    def get_best_bid(self, ticker="069500"):
+        """3~4단계 청산 전 최우선 매수호가를 조회한다. 불확실하면 매도 중단."""
+        data = self._call("/krstock/quote/v1/currentExecution", {
+            "market_cd": "KRX", "iem_cd": _symbol(ticker), "view_main_yn": "Y"
+        }, "매수호가")
+        output = data.get("Output_1")
+        if not isinstance(output, dict) or output.get("bidp") is None:
+            raise NHClientError("매수호가: Output_1.bidp 누락 — 본전 매도 중단")
+        bid = _number(output["bidp"], "최우선 매수호가")
+        if bid <= 0 or not bid.is_integer():
+            raise NHClientError("매수호가가 유효한 원화 정수가 아님")
+        return int(bid)
+
     def get_asset_status(self):
         data = self._call("/krstock/inquiry/v1/assetStatus", {
             "act_no": self.account_no, "eal_aly_cd": "2", "aet_bse": "2",

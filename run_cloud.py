@@ -4,6 +4,7 @@
 주문 접수와 체결을 분리하고 실제 잔고가 확인되기 전에는 신규 주문을 막는다.
 """
 import html
+import math
 import json
 import logging
 import os
@@ -48,7 +49,7 @@ def default_state():
     return {"symbol": SYMBOL, "current_stage": 0, "current_step": 0,
             "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
             "entry_prices": [], "trailing_mode": False, "highest_price": 0,
-            "pending_order": None, "last_run": ""}
+            "pending_order": None, "last_exit_date": "", "last_run": ""}
 
 
 def load_state():
@@ -88,8 +89,63 @@ def reset_position(state):
                   "trailing_mode": False, "highest_price": 0, "pending_order": None})
 
 
-def reconcile_pending(state, actual_qty, actual_avg):
-    """접수한 주문은 현재 보유수량으로 완전체결이 검증된 후에만 단계 확정."""
+def classify_order_side(order):
+    """NH 당일주문체결조회 'sby_dit_cd_nm' 값을 보수적으로 분류한다.
+
+    식별 불가능한 주문은 중복 매도를 막기 위해 자동 주문을 중단한다.
+    """
+    name = str(order.get("sby_dit_cd_nm") or "").strip()
+    if "매도" in name and "매수" not in name:
+        return "sell"
+    if "매수" in name and "매도" not in name:
+        return "buy"
+    raise SafetyHalt(f"주문 매매구분 확인 실패: {name!r} — 중복 매도 방지")
+
+
+def block_duplicate_sell(orders):
+    """당일 매수 체결은 청산을 막지 않되, 매도 이력은 중복 매도를 막는다."""
+    if any(classify_order_side(order) == "sell" for order in orders):
+        raise SafetyHalt("당일 동일 종목 매도 주문 기록 발견 — 중복 매도 방지, 수동 확인 필요")
+
+
+def _order_qty(record, field):
+    raw = record.get(field)
+    try:
+        value = float(str(raw).replace(",", ""))
+        if not math.isfinite(value) or value < 0 or not value.is_integer():
+            raise ValueError("유효한 비음수 정수가 아님")
+        return int(value)
+    except (TypeError, ValueError, OverflowError) as exc:
+        raise SafetyHalt(f"체결조회 {field} 확인 실패: {raw!r}") from exc
+
+
+def verify_sell_filled(pending, order_history):
+    """보유잔고 0주 외에 당일/주문일 매도 전량체결 기록을 필수 확인한다.
+
+    NH 주문 접수 응답의 mkt_orr_no 와 체결조회 itg_orr_no 는 명세상
+    서로 다른 번호 체계일 수 있어 일치한다고 가정하지 않는다. 해당 일자에
+    정확히 하나의 매도 주문만 있고 수량·체결이 완벽히 일치할 때만 허용한다.
+    애매하면 자동 복구하지 않는다.
+    """
+    if order_history is None:
+        raise SafetyHalt("매도 주문 체결내역 없음 — 잔고 0주만으로 청산 확정 금지")
+    sales = [order for order in order_history if classify_order_side(order) == "sell"]
+    if len(sales) != 1:
+        raise SafetyHalt(f"매도 주문 {len(sales)}건: 단일 전량체결 검증 불가능")
+    sale = sales[0]
+    wanted = int(pending["qty"])
+    ordered = _order_qty(sale, "orr_qty")
+    executed = _order_qty(sale, "tot_cns_qty")
+    unfilled = _order_qty(sale, "ny_cns_qty")
+    if ordered != wanted or executed != wanted or unfilled != 0:
+        raise SafetyHalt(f"매도 체결 불완전: 주문 {ordered}, 체결 {executed}, 미체결 {unfilled}, 기대 {wanted}")
+    if "can_qty" in sale and _order_qty(sale, "can_qty") != 0:
+        raise SafetyHalt("취소수량이 존재하여 매도 전량체결 판정 보류")
+    logger.info("[매도 체결검증] %d주 단일 주문 완전체결 + 실잔고 0주", wanted)
+
+
+def reconcile_pending(state, actual_qty, actual_avg, sell_order_history=None):
+    """접수한 주문은 실제 잔고와 체결조회가 충분할 때만 단계 확정."""
     pending = state.get("pending_order")
     if not pending:
         return
@@ -104,7 +160,12 @@ def reconcile_pending(state, actual_qty, actual_avg):
     if side == "sell":
         if actual_qty != 0:
             raise SafetyHalt("매도 완료 수량 검증 실패")
+        verify_sell_filled(pending, sell_order_history)
+        last_exit_date = str(pending.get("created_at") or "")[:10]
+        if len(last_exit_date) != 10:
+            raise SafetyHalt("매도 체결일 확인 실패 — 자동 재진입 중단")
         reset_position(state)
+        state["last_exit_date"] = last_exit_date
     else:
         old_avg = float(pending["before_avg"])
         estimated_price = (actual_qty * actual_avg - before * old_avg) / wanted
@@ -144,6 +205,7 @@ def reconcile_existing(state, actual_qty, actual_avg):
     if actual_qty == 0:
         if stage != 0 or recorded_qty != 0:
             reset_position(state)
+            state["last_exit_date"] = datetime.now(KST).date().isoformat()
             save_state(state)
         return
     if stage not in (1, 2, 3) or recorded_qty != actual_qty:
@@ -153,13 +215,29 @@ def reconcile_existing(state, actual_qty, actual_avg):
     state["avg_price"] = actual_avg
 
 
+def entry_cooldown_active(state, now):
+    """청산일과 그 다음 평일 세션까지 자동 재매수를 막는다 (공휴일은 별도 달력 미반영)."""
+    last = state.get("last_exit_date")
+    if not last:
+        return False
+    try:
+        exit_day = datetime.strptime(last, "%Y-%m-%d").date()
+    except (ValueError, TypeError) as exc:
+        raise SafetyHalt("last_exit_date 상태 불명확 — 신규 진입 금지") from exc
+    next_session = exit_day + timedelta(days=1)
+    while next_session.weekday() >= 5:
+        next_session += timedelta(days=1)
+    return now.date() <= next_session
+
+
 def market_open(now):
     return (now.weekday() < 5 and
             ((now.hour == 9 and now.minute >= 5) or (10 <= now.hour < 15) or
              (now.hour == 15 and now.minute <= 20)))
 
 
-def place_order(client, state, side, qty, quote, target_step, before_qty, before_avg, now):
+def place_order(client, state, side, qty, quote, target_step, before_qty, before_avg, now,
+                sell_limit_price=None):
     if qty <= 0 or (side == "buy" and before_qty + qty > MAX_SHARES):
         raise SafetyHalt("최대 보유수량을 초과하거나 주문수량이 0 이하")
     # 실주문 실행은 운영자의 명시적 환경변수 설정이 필요하다.
@@ -167,14 +245,19 @@ def place_order(client, state, side, qty, quote, target_step, before_qty, before
         logger.warning("[DRY RUN] 실제 주문 비활성: %s %d주", side, qty)
         send_telegram(f"🧪 <b>주문 미실행(DRY RUN)</b> {html.escape(side)} {qty}주")
         return
+    if sell_limit_price is not None and (side != "sell" or sell_limit_price <= 0):
+        raise SafetyHalt("매도 지정가 설정이 유효하지 않음")
+    order_price = (quote if side == "buy" else
+                   int(sell_limit_price) if sell_limit_price is not None else 0)
     state["pending_order"] = {
         "side": side, "qty": qty, "target_step": target_step,
         "before_qty": before_qty, "before_avg": before_avg,
-        "requested_price": quote, "created_at": now.isoformat(),
+        "requested_price": quote, "limit_price": order_price if sell_limit_price is not None else None,
+        "created_at": now.isoformat(),
         "order_no": None, "status": "submitting"
     }
     save_state(state)  # 예외/응답 유실 시에는 다음 실행에서 새 주문을 막는다.
-    receipt = client.submit_order(SYMBOL, qty, side, price=quote if side == "buy" else 0)
+    receipt = client.submit_order(SYMBOL, qty, side, price=order_price)
     state["pending_order"].update({"order_no": receipt["order_no"], "status": "accepted"})
     save_state(state)
     send_telegram(f"📨 <b>주문 접수(체결 미확인)</b> {html.escape(side)} {qty}주 / "
@@ -213,20 +296,35 @@ def run_strategy():
     if outstanding:
         raise SafetyHalt(f"오늘 KODEX 200 미체결 주문 {len(outstanding)}건 — 신규 주문 중단")
 
+    # 매도 pending 은 잔고 0주만으로 확정하지 않고, 주문일 전량체결까지 확인한다.
+    sell_history = None
+    pending = state.get("pending_order")
+    if pending and pending.get("side") == "sell":
+        try:
+            ordered_day = datetime.fromisoformat(pending["created_at"]).strftime("%Y%m%d")
+        except (KeyError, ValueError, TypeError) as exc:
+            raise SafetyHalt("매도 주문일자 확인 실패 — 수동 확인 필요") from exc
+        sell_history = (orders if ordered_day == now.strftime("%Y%m%d") else
+                        client.get_daily_orders(SYMBOL, ordered_day))
+
     # 첫 주문 다음 번 실행까지 pending 유지. 체결 확인 후에만 다음 매매를 허용.
-    reconcile_pending(state, qty, avg)
+    reconcile_pending(state, qty, avg, sell_order_history=sell_history)
     if not state.get("pending_order"):
         reconcile_existing(state, qty, avg)
     stage = int(state["current_step"])
     state["last_run"] = now.isoformat()
     save_state(state)
 
-    # 같은 날의 수동/자동 매매까지 포함하여 일일 중복·연속 주문을 차단한다.
-    if orders:
-        logger.info("오늘 주문 기록 %d건 존재: 중복 주문 방지 위해 거래 생략", len(orders))
+    # 매수: 기존 보수적 정책 유지. 당일 매수/매도 이력이 있으면 새 매수 금지.
+    # 매도: 과거 당일 매수 이력은 청산을 막지 않지만, 매도 이력은 중복매도 방지.
+    if stage == 0 and orders:
+        logger.info("오늘 주문 기록 %d건 존재: 신규 매수 생략", len(orders))
         return
 
     if stage == 0:
+        if entry_cooldown_active(state, now):
+            logger.info("청산 후 다음 거래 세션까지 신규 매수 대기: 청산일 %s", state["last_exit_date"])
+            return
         target_step = 1
         budget = assets["total_asset"] * WEIGHTS[0]
         order_qty = int(budget // quote)
@@ -245,11 +343,22 @@ def run_strategy():
             state["highest_price"] = max(quote, state["highest_price"])
             save_state(state)
             if quote <= state["highest_price"] * (1 - TS_FALLBACK_RATE):
+                block_duplicate_sell(orders)
+                # 1~2단계의 트레일링은 빠른 청산을 우선해 기존 시장가 유지.
                 place_order(client, state, "sell", qty, quote, 0, qty, avg, now)
                 return
     elif stage in (3, 4) and quote >= avg * (1 + ESCAPE_PROFIT_RATE):
-        # +0.05%는 지정가격 트리거이며 순이익/무손실을 보장하지 않는다.
-        place_order(client, state, "sell", qty, quote, 0, qty, avg, now)
+        block_duplicate_sell(orders)
+        # 3~4단계 본전 회복 청산: 시장가 슬리피지 대신 현재 최우선 매수호가에
+        # 지정가 매도. 호가가 발동 가격보다 낮으면 손해 보는 자동 청산을 피한다.
+        # +0.05%는 거래비용 차감 전 가격 조건이며 순손익을 보장하지 않는다.
+        minimum = avg * (1 + ESCAPE_PROFIT_RATE)
+        bid = client.get_best_bid(SYMBOL)
+        if bid < minimum:
+            logger.info("본전 청산 보류: 매수호가 %d원 < 목표가 %.2f원", bid, minimum)
+            return
+        place_order(client, state, "sell", qty, quote, 0, qty, avg, now,
+                    sell_limit_price=bid)
         return
 
     if stage >= 4 or qty >= MAX_SHARES:
