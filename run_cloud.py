@@ -36,20 +36,23 @@ def send_telegram(message):
     token, chat_id = os.getenv("TELEGRAM_BOT_TOKEN"), os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
         logger.info("[Telegram 미설정] %s", message)
-        return
+        return False
     try:
         response = requests.post(f"https://api.telegram.org/bot{token}/sendMessage",
                                  json={"chat_id": chat_id, "text": message, "parse_mode": "HTML"}, timeout=5)
         response.raise_for_status()
+        return True
     except requests.RequestException as exc:
         logger.warning("Telegram 전송 실패: %s", exc)
+        return False
 
 
 def default_state():
     return {"symbol": SYMBOL, "current_stage": 0, "current_step": 0,
             "shares": 0, "avg_price": 0.0, "last_buy_price": 0.0,
             "entry_prices": [], "trailing_mode": False, "highest_price": 0,
-            "pending_order": None, "last_exit_date": "", "last_run": ""}
+            "pending_order": None, "last_exit_date": "", "last_run": "",
+            "last_midday_report_date": ""}
 
 
 def load_state():
@@ -264,7 +267,40 @@ def place_order(client, state, side, qty, quote, target_step, before_qty, before
                   f"접수번호 {html.escape(receipt['order_no'])}")
 
 
-def run_strategy():
+def send_midday_report():
+    now = datetime.now(KST)
+    report_date = now.date().isoformat()
+    state = load_state()
+    if state.get("last_midday_report_date") == report_date:
+        logger.info("오늘 중간보고는 이미 전송했습니다.")
+        return False
+
+    client = NHClient()
+    assets = client.get_asset_status()
+    current = assets["holdings"].get(SYMBOL, {})
+    qty = int(current.get("qty", 0))
+    avg = float(current.get("avg_price", 0))
+    quote = client.get_current_price(SYMBOL)
+    pending = state.get("pending_order")
+    pending_text = ("없음" if not pending else
+                    f"{html.escape(str(pending.get('side', '미상')))} "
+                    f"{html.escape(str(pending.get('qty', '미상')))}주 "
+                    f"({html.escape(str(pending.get('status', '상태 미상')))})")
+    message = (
+        f"🕑 <b>KODEX 200 장중 잠정 스냅샷</b> / {report_date} KST\n"
+        f"보유 {qty}주 / 평단 {avg:,.1f}원 / 현재가 {quote:,}원\n"
+        f"총자산 {assets['total_asset']:,.0f}원 / 미확인 주문: {pending_text}\n"
+        "※ 장중 잠정 보고이며 최종 잔고·자산과 다를 수 있습니다."
+    )
+    if not send_telegram(message):
+        return False
+
+    state["last_midday_report_date"] = report_date
+    save_state(state)
+    return True
+
+
+def _run_strategy_core():
     now = datetime.now(KST)
     logger.info("=== 전략 B %s KST ===", now.strftime("%Y-%m-%d %H:%M:%S"))
     client = NHClient()
@@ -283,10 +319,6 @@ def run_strategy():
     if not market_open(now):
         if state.get("pending_order"):
             logger.warning("미확인 주문이 남아 있습니다. 다음 장중 반드시 확인")
-        if now.hour == 15 and 21 <= now.minute < 50:
-            pnl = ((quote / avg) - 1) * 100 if qty else 0.0
-            send_telegram(f"📊 <b>KODEX 200 결산</b> / {qty}주 / 평단 {avg:,.1f}원 / "
-                          f"현재 {quote:,}원 / 평가손익률 {pnl:+.2f}%")
         state["last_run"] = now.isoformat()
         save_state(state)
         return
@@ -375,6 +407,12 @@ def run_strategy():
             if assets["available_cash"] is None or assets["available_cash"] < order_qty * quote:
                 raise SafetyHalt("주문가능금액 부족/불명확 — 추가매수 금지")
             place_order(client, state, "buy", order_qty, quote, target_step, qty, avg, now)
+
+
+def run_strategy():
+    _run_strategy_core()
+    if os.getenv("RUN_MIDDAY_REPORT") == "Y":
+        send_midday_report()
 
 
 if __name__ == "__main__":
