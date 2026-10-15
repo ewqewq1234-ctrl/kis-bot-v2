@@ -2,8 +2,7 @@ name: ETF Grid Trading Bot (Strategy B)
 
 on:
   schedule:
-    - cron: '0 0-6 * * 1-5'
-    - cron: '35 6 * * 1-5'
+    - cron: '13 0-5 * * 1-5'
   workflow_dispatch:
 
 # 일정·수동 실행 중첩으로 이중 주문하지 않도록 직렬화
@@ -64,5 +63,7 @@ jobs:
             git commit -m 'Auto: Update state.json [skip ci]'
             git push origin HEAD
           else
+            echo '상태파일 변경사항 없음'
+
             echo '상태파일 변경사항 없음'
           fi
