@@ -4,6 +4,8 @@ on:
   schedule:
     - cron: '13 0-4 * * 1-5'
     - cron: '13 5 * * 1-5'
+    # 08:52 KST (Mon–Fri) / 23:52 UTC (previous day)
+    - cron: '52 23 * * 0-4'
   workflow_dispatch:
 
 # 일정·수동 실행 중첩으로 이중 주문하지 않도록 직렬화
