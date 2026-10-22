@@ -2,10 +2,14 @@ name: ETF Grid Trading Bot (Strategy B)
 
 on:
   schedule:
-    # KST 09:00–15:00 / UTC 00:00–06:00, weekdays
-    - cron: '0 0-6 * * 1-5'
-    # KST 15:35 / UTC 06:35, weekdays
-    - cron: '35 6 * * 1-5'
+    # Weekdays: four trading checks, staggered away from the top of the hour.
+    - cron: '17 9,11,13 * * 1-5'
+      timezone: 'Asia/Seoul'
+    - cron: '7 15 * * 1-5'
+      timezone: 'Asia/Seoul'
+    # Existing off-hours report; preserves saved positions and pending orders.
+    - cron: '35 15 * * 1-5'
+      timezone: 'Asia/Seoul'
   workflow_dispatch:
 
 # 일정·수동 실행 중첩으로 이중 주문하지 않도록 직렬화
@@ -47,7 +51,7 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENABLE_LIVE_ORDERS: ${{ vars.ENABLE_LIVE_ORDERS || 'NO' }}
-          RUN_MIDDAY_REPORT: ${{ github.event_name == 'schedule' && github.event.schedule == '35 6 * * 1-5' && 'Y' || 'N' }}
+          RUN_MIDDAY_REPORT: ${{ github.event_name == 'schedule' && github.event.schedule == '35 15 * * 1-5' && 'Y' || 'N' }}
         run: python run_cloud.py
 
       # 전략이 안전중단/오류를 일으켜도 pending 상태를 보존해 재주문 차단

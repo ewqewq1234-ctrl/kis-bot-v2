@@ -234,7 +234,9 @@ class ExecutionGateTests(unittest.TestCase):
 
     def test_production_workflow_schedule_and_safety_settings(self):
         text = (ROOT / ".github/workflows/trade.yml").read_text()
-        for expected in ("'0 0-6 * * 1-5'", "'35 6 * * 1-5'", "cancel-in-progress: false",
+        for expected in ("'17 9,11,13 * * 1-5'", "'7 15 * * 1-5'", "'35 15 * * 1-5'",
+                         "timezone: 'Asia/Seoul'", "github.event.schedule == '35 15 * * 1-5'",
+                         "cancel-in-progress: false",
                          "python-version: '3.11'", "if: always()", "git add state.json",
                          "vars.ENABLE_LIVE_ORDERS || 'NO'", "contents: write"):
             self.assertIn(expected, text)
