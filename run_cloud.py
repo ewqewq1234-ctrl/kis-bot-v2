@@ -275,6 +275,21 @@ def send_midday_report():
         logger.info("오늘 중간보고는 이미 전송했습니다.")
         return False
 
+    if not market_open(now):
+        # Retain the scheduled Telegram report without claiming account/fill verification.
+        pending = "있음 (체결 미확인)" if state.get("pending_order") else "저장 기록 없음"
+        message = (
+            f"🕑 <b>KODEX 200 장외 대기</b> / {report_date} KST\n"
+            f"저장 보유 {state['shares']}주 / 저장 평단 {state['avg_price']:,.1f}원\n"
+            f"미확인 주문: {pending}\n"
+            "※ 실계좌·시세 미조회. 저장 기록이며 현재 잔고 또는 체결 확인이 아닙니다."
+        )
+        if not send_telegram(message):
+            return False
+        state["last_midday_report_date"] = report_date
+        save_state(state)
+        return True
+
     client = NHClient()
     assets = client.get_asset_status()
     current = assets["holdings"].get(SYMBOL, {})
@@ -303,8 +318,17 @@ def send_midday_report():
 def _run_strategy_core():
     now = datetime.now(KST)
     logger.info("=== 전략 B %s KST ===", now.strftime("%Y-%m-%d %H:%M:%S"))
-    client = NHClient()
     state = load_state()
+    # Time gate precedes broker construction and all account/quote/order inquiries.
+    # Only execution metadata is recorded; saved positions and pending are not evidence of fills.
+    if not market_open(now):
+        logger.info("장외 대기: 계좌·시세·주문 조회 생략, 매수·매도 금지 (체결 미확인)")
+        if state.get("pending_order"):
+            logger.warning("미확인 주문이 남아 있습니다. 다음 장중 반드시 확인")
+        state["last_run"] = now.isoformat()
+        save_state(state)
+        return
+    client = NHClient()
     assets = client.get_asset_status()
     current = assets["holdings"].get(SYMBOL, {})
     qty, avg = int(current.get("qty", 0)), float(current.get("avg_price", 0))
@@ -314,14 +338,6 @@ def _run_strategy_core():
         raise SafetyHalt("실계좌 평균매수가 누락")
     if qty > MAX_SHARES:
         raise SafetyHalt("계좌 보유량이 설정 상한 초과")
-
-    # 장 외에는 주문조회 호출을 최소화하되, 오래된 pending 주문은 해제하지 않는다.
-    if not market_open(now):
-        if state.get("pending_order"):
-            logger.warning("미확인 주문이 남아 있습니다. 다음 장중 반드시 확인")
-        state["last_run"] = now.isoformat()
-        save_state(state)
-        return
 
     orders = client.get_daily_orders(SYMBOL, now.strftime("%Y%m%d"))
     outstanding = [o for o in orders if float(o["ny_cns_qty"]) > 0]
