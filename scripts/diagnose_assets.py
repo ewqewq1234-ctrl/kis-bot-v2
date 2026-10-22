@@ -33,7 +33,8 @@ def summarize(data):
             raw_qty = item.get("itg_bnc_qty")
             qty = float(str(raw_qty).replace(",", "")) if valid_number(raw_qty) else None
             result["positions"].append({
-                "symbol": symbol if re.fullmatch(r"[0-9]{6}", symbol) else "non_domestic_symbol",
+                "symbol": symbol if re.fullmatch(r"[A-Z0-9]{6,12}", symbol) else "unrecognized_symbol",
+                "asset_class": str(item.get("iem_mlf_nm") or "")[:50],
                 "qty": qty, "phs_pr_present": "phs_pr" in item,
                 "phs_pr_valid": valid_number(item.get("phs_pr"), positive=True),
                 "phs_pr_zero": valid_number(item.get("phs_pr")) and float(str(item["phs_pr"]).replace(",", "")) == 0,
