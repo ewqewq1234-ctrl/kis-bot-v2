@@ -92,3 +92,13 @@ iwr -useb https://raw.githubusercontent.com/PLUG-OpenAPI/nhplug-sdk/main/templat
 공식 명세: https://www.nhplug.com/openapi-docs/krstock/openapi.json
 (261015 기준), https://www.nhplug.com/llms-full.txt
 SDK: https://github.com/PLUG-OpenAPI/nhplug-sdk
+
+
+## 현재 예약 실행 시간 (한국 시간)
+
+평일 장중 09:17, 11:17, 13:17, 15:07에 총 4회 실행한다.
+15:35에는 기존 장외 보고를 유지한다 (전체 예약 5회/일).
+각 cron에 `timezone: Asia/Seoul`을 명시하고 매시 정각을 피한다.
+15:35 보고 판별식도 한국 시간 cron과 일치시킨다.
+GitHub schedule은 지정 시각의 실행 요청이며 지연·누락 가능성은 남아 있다.
+전략 B와 거래 가능 시간(09:05~15:20), 주문 안전장치는 변경하지 않는다.
