@@ -178,6 +178,9 @@ class NHClient:
             raise NHClientError("주식잔고조회: NH API 통신 실패 — 주문 보류") from None
         if not page_seen:
             raise NHClientError("주식잔고조회: 응답 없음 (0주로 추정 금지)")
+        if meta.has_next:
+            # SDK also stops on repeated continuation keys: this is not a complete snapshot.
+            raise NHClientError("주식잔고조회: 연속조회 미완료 — 주문 보류")
         # The official API supplies aggregate totals only after all holdings are read.
         if not isinstance(final_summary, dict):
             raise NHClientError("주식잔고조회: 최종 요약 출력 누락 (0주로 추정 금지)")

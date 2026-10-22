@@ -144,6 +144,12 @@ class AssetParsingTests(unittest.TestCase):
             with self.assertRaises(nh_client.NHClientError):
                 self.client.get_asset_status()
 
+    def test_premature_pagination_end_blocks(self):
+        pages = [(balance([row()]), types.SimpleNamespace(has_next=True))]
+        with patch.object(nh_client, "paginate", return_value=iter(pages)):
+            with self.assertRaisesRegex(nh_client.NHClientError, "연속조회 미완료"):
+                self.client.get_asset_status()
+
     def test_missing_final_summary_blocks(self):
         pages = [({"Output_1": [row()]}, types.SimpleNamespace(has_next=False))]
         with patch.object(nh_client, "paginate", return_value=iter(pages)):
