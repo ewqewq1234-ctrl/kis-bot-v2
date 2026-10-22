@@ -65,3 +65,30 @@ iwr -useb https://raw.githubusercontent.com/PLUG-OpenAPI/nhplug-sdk/main/templat
 - [Antigravity·Cursor 로 바이브코딩하기](../guides/antigravity.md) — 설치부터 첫 실행까지
 - [SDK README](../README.md) · [저장소 AGENTS.md](../AGENTS.md)
 - 명세 정본: [llms.txt](https://www.nhplug.com/llms.txt) (N2: [n2plug](https://www.n2plug.com/llms.txt))
+
+
+## 자산조회 안전 수정 (2026-10-22)
+
+- 원인: `assetStatus.Output_1`에는 ETF 외에 발행어음도 포함된다. 실제 조회에서
+  발행어음은 수량이 양수이고 `phs_pr=0`이었다. 이를 주식 평단으로 검증하던 오류를 수정했다.
+- 총자산·주문가능금액은 기존 `assetStatus.Output_0`를 유지한다. 주식 보유 수량과
+  매입가격은 공식 `/krstock/inquiry/v1/balance`의 전체 페이지에서 검증한다.
+  특정 종목/자산명 예외 목록이나 현재가·평가금액을 이용한 평단 추정은 사용하지 않는다.
+- 공식 필드: `phs_pr` = 매입가격, `itg_bnc_qty` = 통합잔고수량.
+  자산현황의 가격 스키마는 number(15.2), 주식잔고의 가격 스키마는 integer(18)이다.
+  SDK 0.4.1은 응답을 그대로 반환한다. 숫자 문자열은 파싱하지만 null·비유한값·음수·0원은
+  양수 보유 주식의 유효한 매입가격으로 인정하지 않는다. 다른 가격 필드로 대체하지 않는다.
+- 잔고 조회 실패·불완전한 연속조회·중복잔고·양수 보유의 평단 불명확 시 전체 주문을 차단한다.
+  빈 주식잔고는 최종 총매수금액과 총평가금액이 모두 0일 때만 인정한다.
+- 장외에는 계좌·시세·주문 조회 전에 대기하며 보유·평단·pending을 보존한다.
+  15:35 예약 보고는 저장 기록임을 표시하고 실계좌/체결 확인으로 사용하지 않는다.
+  장중 조회 오류는 실패 종료를 유지한다. 전략 B, 32주 상한 및 운영 workflow는 변경하지 않는다.
+- `scripts/diagnose_assets.py`와 별도 검증 workflow는 조회만 수행하며 전략을 실행하거나
+  상태파일을 저장하지 않는다. 원본 응답·자격증명·계좌번호·평단 숫자는 출력하지 않는다.
+- 명세에는 계좌유형별 별도 응답 스키마, 야간 평단 누락 규칙, 숫자 null 허용 규칙이 없다.
+  이번 야간 실조회는 성공했으며 오류 원인은 시간대 제한이 아닌 발행어음 행의 오해석이었다.
+  실패 당시 원본 응답은 남아 있지 않아 당시 전체 내용 자체를 복원한 것은 아니다.
+
+공식 명세: https://www.nhplug.com/openapi-docs/krstock/openapi.json
+(261015 기준), https://www.nhplug.com/llms-full.txt
+SDK: https://github.com/PLUG-OpenAPI/nhplug-sdk

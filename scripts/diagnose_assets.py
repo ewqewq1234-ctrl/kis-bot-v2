@@ -63,6 +63,39 @@ def main():
             # SDK exceptions may contain the full response or credentials; never print them.
             print(name + "=query_failed_details_redacted")
             failed = True
+    # Exercise the production parser without the strategy, state files, quotes, or orders.
+    # Restrict both SDK entrypoints to the two documented read-only inquiries.
+    import nh_client
+    original_call, original_paginate = nh_client.call, nh_client.paginate
+    allowed = {"/krstock/inquiry/v1/assetStatus", "/krstock/inquiry/v1/balance"}
+
+    def read_call(path, *args, **kwargs):
+        if path not in allowed:
+            raise RuntimeError("non-inquiry path forbidden")
+        return original_call(path, *args, **kwargs)
+
+    def read_pages(path, *args, **kwargs):
+        if path not in allowed:
+            raise RuntimeError("non-inquiry path forbidden")
+        return original_paginate(path, *args, **kwargs)
+
+    def no_order(*args, **kwargs):
+        raise RuntimeError("orders forbidden in diagnostics")
+
+    nh_client.call, nh_client.paginate = read_call, read_pages
+    nh_client.NHClient.submit_order = no_order
+    try:
+        parsed = nh_client.NHClient().get_asset_status()
+        holdings = parsed["holdings"]
+        print("production_parser=" + json.dumps({
+            "success": True, "stock_positions": [
+                {"symbol": symbol if re.fullmatch(r"[A-Z0-9]{6,12}", symbol) else "unrecognized_symbol",
+                 "qty": item["qty"],
+                 "avg_valid": valid_number(item["avg_price"], positive=True) if item["qty"] else True}
+                for symbol, item in holdings.items()]}, allow_nan=False))
+    except Exception:
+        print("production_parser=failed_details_redacted")
+        failed = True
     return int(failed)
 
 

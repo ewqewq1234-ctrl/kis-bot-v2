@@ -103,21 +103,9 @@ class NHClient:
             "act_no": self.account_no, "eal_aly_cd": "2", "aet_bse": "2",
             "qut_dit_cd": "UNT", "aly_qut_cd": "1"
         }, "자산조회")
-        summary, rows = data.get("Output_0"), data.get("Output_1")
+        summary = data.get("Output_0")
         if not isinstance(summary, dict):
             raise NHClientError("자산조회: Output_0 누락")
-        if rows is None:
-            # 공식 명세에서 데이터가 없는 출력블록은 생략될 수 있다.
-            # '총매수/총평가금액 모두 0'으로 검증된 빈 계좌만 0주 허용한다.
-            if (summary.get("tot_byn_amt") is not None
-                    and summary.get("tot_eal_amt") is not None
-                    and _number(summary["tot_byn_amt"], "총매수금액") == 0
-                    and _number(summary["tot_eal_amt"], "총평가금액") == 0):
-                rows = []
-            else:
-                raise NHClientError("자산조회: 잔고 출력 블록 누락 (0주로 추정 금지)")
-        if not isinstance(rows, list):
-            raise NHClientError("자산조회: Output_1 형식 오류")
         if summary.get("tot_aet_amt") is None:
             raise NHClientError("자산조회: tot_aet_amt 누락")
         total_asset = _number(summary["tot_aet_amt"], "총자산")
@@ -125,6 +113,10 @@ class NHClient:
             raise NHClientError("자산조회: 총자산 음수")
         available = summary.get("stk_orr_pbl_amt")
         available_cash = _number(available, "주문가능금액") if available is not None else None
+        # assetStatus also contains non-stock assets (e.g. 발행어음 with phs_pr=0).
+        # Stock membership/quantity must come from the official stock balance view,
+        # never from a guessed asset-class name or a hard-coded ticker exception.
+        rows = self._get_stock_balance_rows()
         holdings = {}
         for item in rows:
             if not isinstance(item, dict) or "iem_cd" not in item or "itg_bnc_qty" not in item:
@@ -133,13 +125,71 @@ class NHClient:
             qty = _number(item["itg_bnc_qty"], "보유수량")
             if qty < 0 or not qty.is_integer():
                 raise NHClientError("자산조회: 비정상 보유수량")
-            avg = _number(item.get("phs_pr"), "평균매입가") if qty > 0 else 0.0
-            if qty > 0 and avg <= 0:
-                raise NHClientError("자산조회: 평균매입가 누락")
+            avg = 0.0
+            if qty > 0:
+                # Official balance Output_1.phs_pr = 매입가격 (18).
+                # No documented alternate price in this block: never use now_pr/eal_amt.
+                try:
+                    avg = float(str(item.get("phs_pr")).replace(",", "").strip())
+                    valid = math.isfinite(avg) and avg > 0
+                except (TypeError, ValueError):
+                    valid = False
+                if not valid:
+                    symbol_label = sym if len(sym) == 6 and sym.isascii() and sym.isdigit() else "식별불가"
+                    presence = "누락" if item.get("phs_pr") is None else "유효하지 않음"
+                    raise NHClientError(
+                        f"[NH 자산조회 오류]\n종목: {symbol_label}\n보유 수량: {int(qty)}주\n"
+                        f"평균매입가 필드(phs_pr): {presence}\n조치: 신규 주문 및 매도 주문 보류"
+                    ) from None
             if sym in holdings:
                 raise NHClientError(f"자산조회: 종목 {sym} 다중잔고 확인 필요")
             holdings[sym] = {"qty": int(qty), "avg_price": avg}
         return {"total_asset": total_asset, "available_cash": available_cash, "holdings": holdings}
+
+    def _get_stock_balance_rows(self):
+        """Complete official stock-only balance; missing/partial responses never mean zero."""
+        payload = {"act_no": self.account_no, "bnc_bse_cd": "5", "ltg_aot_dit_cd": "9",
+                   "aet_bse": "2", "qut_dit_cd": "UNT", "aly_qut_cd": "1"}
+        rows, final_summary = [], None
+        page_seen = False
+        try:
+            pages = paginate("/krstock/inquiry/v1/balance", payload,
+                             max_pages=6, want_meta=True, timeout=15)
+            for index, (data, meta) in enumerate(pages):
+                page_seen = True
+                _check_business_result(data, "주식잔고조회")
+                page_rows = data.get("Output_1")
+                summary = data.get("Output_0")
+                if page_rows is None:
+                    if not isinstance(summary, dict):
+                        raise NHClientError("주식잔고조회: 잔고·요약 출력 누락 (0주로 추정 금지)")
+                    if (summary.get("tot_byn_amt") is None or summary.get("tot_eal_amt") is None
+                            or _number(summary["tot_byn_amt"], "총매수금액") != 0
+                            or _number(summary["tot_eal_amt"], "총평가금액") != 0):
+                        raise NHClientError("주식잔고조회: 잔고 출력 누락 (0주로 추정 금지)")
+                    page_rows = []
+                if not isinstance(page_rows, list):
+                    raise NHClientError("주식잔고조회: Output_1 형식 오류")
+                rows.extend(page_rows)
+                final_summary = summary
+                if index == 5 and meta.has_next:
+                    raise NHClientError("주식잔고조회: 6페이지 초과, 전체 잔고 확인 실패")
+        except NhplugError:
+            raise NHClientError("주식잔고조회: NH API 통신 실패 — 주문 보류") from None
+        if not page_seen:
+            raise NHClientError("주식잔고조회: 응답 없음 (0주로 추정 금지)")
+        # The official API supplies aggregate totals only after all holdings are read.
+        if not isinstance(final_summary, dict):
+            raise NHClientError("주식잔고조회: 최종 요약 출력 누락 (0주로 추정 금지)")
+        for field in ("tot_byn_amt", "tot_eal_amt"):
+            if final_summary.get(field) is None or _number(final_summary[field], field) < 0:
+                raise NHClientError("주식잔고조회: 최종 합계 검증 실패")
+        if not rows:
+            if (final_summary.get("tot_byn_amt") is None or final_summary.get("tot_eal_amt") is None
+                    or _number(final_summary["tot_byn_amt"], "총매수금액") != 0
+                    or _number(final_summary["tot_eal_amt"], "총평가금액") != 0):
+                raise NHClientError("주식잔고조회: 빈 잔고 검증 실패 (0주로 추정 금지)")
+        return rows
 
     def get_daily_orders(self, ticker, order_date=None):
         day = order_date or datetime.now(KST).strftime("%Y%m%d")
