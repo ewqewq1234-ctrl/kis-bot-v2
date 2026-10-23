@@ -2,13 +2,8 @@ name: ETF Grid Trading Bot (Strategy B)
 
 on:
   schedule:
-    # Weekdays: four trading checks, staggered away from the top of the hour.
-    - cron: '17 9,11,13 * * 1-5'
-      timezone: 'Asia/Seoul'
-    - cron: '7 15 * * 1-5'
-      timezone: 'Asia/Seoul'
-    # Existing off-hours report; preserves saved positions and pending orders.
-    - cron: '35 15 * * 1-5'
+    # Every weekday hour at minute 12, in Korean local time.
+    - cron: '12 * * * 1-5'
       timezone: 'Asia/Seoul'
   workflow_dispatch:
 
@@ -25,25 +20,45 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
+      - name: Exit immediately outside weekday market/report hours
+        id: runtime
+        shell: bash
+        run: |
+          python3 - <<'PYGATE'
+          import os
+          from datetime import datetime
+          from zoneinfo import ZoneInfo
+          now = datetime.now(ZoneInfo("Asia/Seoul"))
+          active = now.weekday() < 5 and 9 <= now.hour < 17
+          with open(os.environ["GITHUB_OUTPUT"], "a") as output:
+              output.write(f"active={str(active).lower()}\n")
+          print(f"Actual KST time: {now.isoformat()}; active={active}")
+          PYGATE
+
       - name: 저장소 체크아웃
+        if: steps.runtime.outputs.active == 'true'
         uses: actions/checkout@v4
         with:
           persist-credentials: true
 
       - name: 파이썬 3.11 환경 설정
+        if: steps.runtime.outputs.active == 'true'
         uses: actions/setup-python@v5
         with:
           python-version: '3.11'
 
       - name: 라이브러리 설치
+        if: steps.runtime.outputs.active == 'true'
         run: pip install -r requirements.txt
 
       - name: 정적/단위 테스트
+        if: steps.runtime.outputs.active == 'true'
         run: |
           python -m compileall -q run_cloud.py nh_client.py
           python -m unittest discover -s tests -v
 
       - name: 전략 B 실행 (기본은 주문 비활성)
+        if: steps.runtime.outputs.active == 'true'
         env:
           NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
           NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
@@ -51,12 +66,13 @@ jobs:
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
           ENABLE_LIVE_ORDERS: ${{ vars.ENABLE_LIVE_ORDERS || 'NO' }}
-          RUN_MIDDAY_REPORT: ${{ github.event_name == 'schedule' && github.event.schedule == '35 15 * * 1-5' && 'Y' || 'N' }}
+          RUN_MIDDAY_REPORT: 'N'
+          HOURLY_OPERATION: 'Y'
         run: python run_cloud.py
 
       # 전략이 안전중단/오류를 일으켜도 pending 상태를 보존해 재주문 차단
       - name: 상태파일 변경 커밋
-        if: always()
+        if: always() && steps.runtime.outputs.active == 'true'
         shell: bash
         run: |
           set -euo pipefail
@@ -75,3 +91,4 @@ jobs:
 
             echo '상태파일 변경사항 없음'
           fi
+

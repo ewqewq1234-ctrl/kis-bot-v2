@@ -267,11 +267,16 @@ def place_order(client, state, side, qty, quote, target_step, before_qty, before
                   f"접수번호 {html.escape(receipt['order_no'])}")
 
 
-def send_midday_report():
+def send_midday_report(hourly=False):
     now = datetime.now(KST)
     report_date = now.date().isoformat()
+    if hourly and (now.weekday() >= 5 or not 15 <= now.hour < 17):
+        return False
+    phase = "provisional" if (now.hour, now.minute) < (15, 30) else "closing"
+    report_key = f"{report_date}:{phase}" if hourly else report_date
+    report_field = "last_hourly_report" if hourly else "last_midday_report_date"
     state = load_state()
-    if state.get("last_midday_report_date") == report_date:
+    if state.get(report_field) == report_key:
         logger.info("오늘 중간보고는 이미 전송했습니다.")
         return False
 
@@ -279,14 +284,14 @@ def send_midday_report():
         # Retain the scheduled Telegram report without claiming account/fill verification.
         pending = "있음 (체결 미확인)" if state.get("pending_order") else "저장 기록 없음"
         message = (
-            f"🕑 <b>KODEX 200 장외 대기</b> / {report_date} KST\n"
+            f"🕑 <b>KODEX 200 {'장 마감' if phase == 'closing' else '장중 잠정'} 저장 상태 보고</b> / {report_date} KST\n"
             f"저장 보유 {state['shares']}주 / 저장 평단 {state['avg_price']:,.1f}원\n"
             f"미확인 주문: {pending}\n"
             "※ 실계좌·시세 미조회. 저장 기록이며 현재 잔고 또는 체결 확인이 아닙니다."
         )
         if not send_telegram(message):
             return False
-        state["last_midday_report_date"] = report_date
+        state[report_field] = report_key
         save_state(state)
         return True
 
@@ -310,7 +315,7 @@ def send_midday_report():
     if not send_telegram(message):
         return False
 
-    state["last_midday_report_date"] = report_date
+    state[report_field] = report_key
     save_state(state)
     return True
 
@@ -426,6 +431,16 @@ def _run_strategy_core():
 
 
 def run_strategy():
+    if os.getenv("HOURLY_OPERATION") == "Y":
+        now = datetime.now(KST)
+        if now.weekday() >= 5 or not 9 <= now.hour < 17:
+            logger.info("장외/주말 즉시 종료 (브로커·알림 호출 없음)")
+            return
+        if market_open(now):
+            _run_strategy_core()
+        if 15 <= now.hour < 17:
+            send_midday_report(hourly=True)
+        return
     _run_strategy_core()
     if os.getenv("RUN_MIDDAY_REPORT") == "Y":
         send_midday_report()
@@ -438,3 +453,4 @@ if __name__ == "__main__":
         logger.error("[거래 중단] %s", error, exc_info=True)
         send_telegram(f"🚨 <b>자동매매 안전중단</b>\n{html.escape(str(error))}")
         raise SystemExit(1)
+
