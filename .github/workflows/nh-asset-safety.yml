@@ -2,13 +2,12 @@ name: NH asset safety verification (no orders)
 
 on:
   push:
-    branches: [fix/nh-asset-safety-20261022, main]
+    branches: [main]
   pull_request:
     paths:
       - 'nh_client.py'
       - 'run_cloud.py'
       - 'tests/**'
-      - 'scripts/diagnose_assets.py'
       - '.github/workflows/nh-asset-safety.yml'
 
 permissions:
@@ -23,24 +22,5 @@ jobs:
         with:
           python-version: '3.11'
       - run: pip install -r requirements.txt
-      - run: python -m compileall -q nh_client.py run_cloud.py scripts/diagnose_assets.py
+      - run: python -m compileall -q nh_client.py run_cloud.py
       - run: python -m unittest discover -s tests -v
-  read-only-diagnostic:
-    if: github.event_name == 'push' && github.ref == 'refs/heads/fix/nh-asset-safety-20261022'
-    needs: offline
-    runs-on: ubuntu-latest
-    timeout-minutes: 3
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.11'
-      - run: pip install 'nhplug==0.4.1'
-      - name: Read-only assetStatus and balance (no state writes)
-        env:
-          NH_APP_KEY: ${{ secrets.NH_APP_KEY }}
-          NH_APP_SECRET: ${{ secrets.NH_APP_SECRET }}
-          NH_ACCOUNT_NO: ${{ secrets.NH_ACCOUNT_NO }}
-        run: PYTHONPATH=. python scripts/diagnose_assets.py
