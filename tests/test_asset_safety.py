@@ -234,7 +234,7 @@ class ExecutionGateTests(unittest.TestCase):
 
     def test_production_workflow_schedule_and_safety_settings(self):
         text = (ROOT / ".github/workflows/trade.yml").read_text()
-        for expected in ("'12 22,23 * * 0-4'", "'12 0-8 * * 1-5'", "HOURLY_OPERATION: 'Y'", "id: runtime",
+        for expected in ("'12 22 * * 0-4'", "'12 23 * * 0-4'", "'12 0 * * 1-5'", "'12 1 * * 1-5'", "'12 2 * * 1-5'", "'12 3 * * 1-5'", "'12 4 * * 1-5'", "'12 5 * * 1-5'", "'12 6 * * 1-5'", "'12 7 * * 1-5'", "'12 8 * * 1-5'", "HOURLY_OPERATION: 'Y'", "id: runtime",
                          "9 <= now.hour < 17",
                          "cancel-in-progress: false",
                          "python-version: '3.11'", "if: always()", "git add state.json",
