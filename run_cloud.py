@@ -12,13 +12,14 @@ import tempfile
 from datetime import datetime, timedelta, timezone
 
 import requests
-from nh_client import NHClient, NHClientError
+from nh_client import NHClient, NHClientError, redact_sensitive
 
 KST = timezone(timedelta(hours=9))
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 logger = logging.getLogger("StrategyB_Cloud")
 
 STATE_FILE = "state.json"
+API_HEALTH_FILE = "nh_api_health.json"  # 연속 장애 횟수 전용; 매매 상태와 분리
 SYMBOL = "069500"  # KODEX 200
 MAX_SHARES = 32  # 사용자 실계좌 보유 상한 (증액 전 재검토 필요)
 WEIGHTS = [0.10, 0.20, 0.30, 0.40]
@@ -43,7 +44,7 @@ def send_telegram(message):
         response.raise_for_status()
         return True
     except requests.RequestException as exc:
-        logger.warning("Telegram 전송 실패: %s", exc)
+        logger.warning("Telegram 전송 실패: %s", redact_sensitive(exc))
         return False
 
 
@@ -84,6 +85,34 @@ def save_state(state):
     finally:
         if os.path.exists(temp):
             os.unlink(temp)
+
+
+
+def update_api_health(failed=False):
+    """영속화된 NH API 연속 장애 횟수(인증정보·잔고·주문내역 저장 금지)."""
+    try:
+        previous = {}
+        if os.path.exists(API_HEALTH_FILE):
+            with open(API_HEALTH_FILE, encoding="utf-8") as src:
+                previous = json.load(src)
+            if not isinstance(previous, dict):
+                previous = {}
+        count = min(999, max(0, int(previous.get("consecutive_failures", 0))) + 1) if failed else 0
+        path = os.path.abspath(API_HEALTH_FILE)
+        fd, temp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".nh-health-", suffix=".tmp")
+        try:
+            with os.fdopen(fd, "w", encoding="utf-8") as dest:
+                json.dump({"consecutive_failures": count}, dest)
+                dest.flush()
+                os.fsync(dest.fileno())
+            os.replace(temp, path)
+        finally:
+            if os.path.exists(temp):
+                os.unlink(temp)
+        return count
+    except (OSError, ValueError, TypeError):
+        logger.warning("NH API 장애 횟수 저장 실패 (거래 상태는 보존)")
+        return None
 
 
 def reset_position(state):
@@ -438,10 +467,12 @@ def run_strategy():
             return
         if market_open(now):
             _run_strategy_core()
+            update_api_health(failed=False)
         if 15 <= now.hour < 17:
             send_midday_report(hourly=True)
         return
     _run_strategy_core()
+    update_api_health(failed=False)
     if os.getenv("RUN_MIDDAY_REPORT") == "Y":
         send_midday_report()
 
@@ -450,7 +481,16 @@ if __name__ == "__main__":
     try:
         run_strategy()
     except (SafetyHalt, NHClientError, OSError, ValueError, KeyError, TypeError) as error:
-        logger.error("[거래 중단] %s", error, exc_info=True)
-        send_telegram(f"🚨 <b>자동매매 안전중단</b>\n{html.escape(str(error))}")
+        # 원본 SDK 예외의 URL에는 appkey/appsecretkey가 포함될 수 있다.
+        # traceback 전체를 노출하지 않고 분류된 메시지만 기록/전송한다.
+        safe_message = redact_sensitive(error)
+        logger.error("[거래 중단] %s", safe_message)
+        is_api_failure = isinstance(error, NHClientError) and any(
+            code in safe_message for code in
+            ("[network_timeout]", "[auth_rejected]", "[rate_limited]", "[temporary_server_error]", "[unclassified]")
+        )
+        failures = update_api_health(failed=True) if is_api_failure else None
+        repeat_info = f"\nNH API 연속 장애: {failures}회" if failures is not None and failures >= 2 else ""
+        send_telegram(f"🚨 <b>자동매매 안전중단</b>\n{html.escape(safe_message + repeat_info)}")
         raise SystemExit(1)
 
