@@ -22,16 +22,16 @@ class NHClientError(RuntimeError):
 
 # SDK 오류에는 인증 URL(query string에 appkey/appsecretkey 포함)이 실릴 수 있다.
 # 오류 전문/원인 예외를 로깅하지 않고 안전하게 유형만 노출한다.
-_SENSITIVE_QUERY = re.compile(r"(?i)([?&](?:appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|token)=)[^\\s&#]+")
-_SENSITIVE_KV = re.compile(r"(?i)\\b(appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|authorization)\\b\\s*[:=]\\s*[^\\s,&}]+")
-_SENSITIVE_URL = re.compile(r"https?://[^\\s]+", re.IGNORECASE)
+_SENSITIVE_QUERY = re.compile(r"(?i)([?&](?:appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|token)=)[^\s&#]+")
+_SENSITIVE_KV = re.compile(r"(?i)\b(appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|authorization)\b\s*[:=]\s*[^\s,&}]+")
+_SENSITIVE_URL = re.compile(r"https?://[^\s]+", re.IGNORECASE)
 
 
 def redact_sensitive(value):
     """알림·진단 출력용. 토큰/URL 및 알려진 자격증명을 노출하지 않는다."""
     result = str(value)
-    result = _SENSITIVE_QUERY.sub(r"\\1[REDACTED]", result)
-    result = _SENSITIVE_KV.sub(r"\\1=[REDACTED]", result)
+    result = _SENSITIVE_QUERY.sub(r"\1[REDACTED]", result)
+    result = _SENSITIVE_KV.sub(r"\1=[REDACTED]", result)
     # 예외의 URL에 비정형 인증 파라미터가 있을 가능성까지 차단한다.
     result = _SENSITIVE_URL.sub("[URL_REDACTED]", result)
     for env_name in ("NH_APP_KEY", "NH_APP_SECRET", "NHPLUG_APP_KEY", "NHPLUG_APP_SECRET",
