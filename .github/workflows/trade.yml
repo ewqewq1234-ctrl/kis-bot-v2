@@ -95,7 +95,10 @@ jobs:
           git config user.name 'github-actions[bot]'
           git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
           git add state.json
-          if ! git diff --cached --quiet -- state.json; then
+          if [[ -f nh_api_health.json ]]; then
+            git add nh_api_health.json
+          fi
+          if ! git diff --cached --quiet -- state.json nh_api_health.json; then
             git commit -m 'Auto: Update state.json [skip ci]'
             git push origin HEAD
           else
