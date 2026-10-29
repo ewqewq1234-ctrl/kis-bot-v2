@@ -6,6 +6,8 @@ HTTP 200은 업무 성공을 보장하지 않으므로, 필수 출력 검증과 
 import logging
 import math
 import os
+import re
+import time
 from datetime import datetime, timedelta, timezone
 
 from nhplug import NhplugError, call, paginate, status_of
@@ -16,6 +18,59 @@ KST = timezone(timedelta(hours=9))
 
 class NHClientError(RuntimeError):
     """결과 불확실 포함: 이 예외가 발생하면 새로운 주문을 보내지 않는다."""
+
+
+# SDK 오류에는 인증 URL(query string에 appkey/appsecretkey 포함)이 실릴 수 있다.
+# 오류 전문/원인 예외를 로깅하지 않고 안전하게 유형만 노출한다.
+_SENSITIVE_QUERY = re.compile(r"(?i)([?&](?:appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|token)=)[^\\s&#]+")
+_SENSITIVE_KV = re.compile(r"(?i)\\b(appkey|appsecretkey|app_secret|app_key|access_token|refresh_token|authorization)\\b\\s*[:=]\\s*[^\\s,&}]+")
+_SENSITIVE_URL = re.compile(r"https?://[^\\s]+", re.IGNORECASE)
+
+
+def redact_sensitive(value):
+    """알림·진단 출력용. 토큰/URL 및 알려진 자격증명을 노출하지 않는다."""
+    result = str(value)
+    result = _SENSITIVE_QUERY.sub(r"\\1[REDACTED]", result)
+    result = _SENSITIVE_KV.sub(r"\\1=[REDACTED]", result)
+    # 예외의 URL에 비정형 인증 파라미터가 있을 가능성까지 차단한다.
+    result = _SENSITIVE_URL.sub("[URL_REDACTED]", result)
+    for env_name in ("NH_APP_KEY", "NH_APP_SECRET", "NHPLUG_APP_KEY", "NHPLUG_APP_SECRET",
+                     "TELEGRAM_BOT_TOKEN", "NH_ACCOUNT_NO"):
+        secret = os.getenv(env_name)
+        if secret:
+            result = result.replace(secret, "[REDACTED]")
+    return result
+
+
+def classify_nh_failure(exc):
+    """HTTP 응답과 연결 타임아웃을 구분. 원본 예외는 반환하지 않는다."""
+    raw = str(exc).lower()
+    if any(term in raw for term in ("connecttimeout", "timed out", "timeout", "connectionerror",
+                                     "connection refused", "name resolution", "network error",
+                                     "네트워크 오류", "max retries exceeded", "연결 실패")):
+        return "network_timeout"
+    if any(term in raw for term in ("401", "403", "invalid_client", "unauthorized",
+                                     "forbidden", "invalid credential", "invalid_grant",
+                                     "인증 거부", "인증 실패", "유효하지 않은")):
+        return "auth_rejected"
+    if any(term in raw for term in ("429", "rate limit", "too many requests", "호출 제한")):
+        return "rate_limited"
+    if any(term in raw for term in ("502", "503", "504", "bad gateway", "service unavailable")):
+        return "temporary_server_error"
+    return "unclassified"
+
+
+def safe_nh_error(label, exc):
+    kind = classify_nh_failure(exc)
+    hints = {
+        "network_timeout": "NH API 연결 시간초과/네트워크 오류",
+        "auth_rejected": "인증 거부 (키/권한/상태 확인 필요)",
+        "rate_limited": "API 요청 제한",
+        "temporary_server_error": "NH API 서버 일시 오류",
+        "unclassified": "API 통신 오류 (원인 미확정)",
+    }
+    return NHClientError(f"{label}: {hints[kind]} [{kind}] — 주문 보류")
+
 
 
 def _number(value, field):
@@ -67,11 +122,22 @@ class NHClient:
         os.environ.setdefault("NHPLUG_BASE_URL", "https://api.nhplug.com:8443")
 
     def _call(self, path, payload, label):
-        try:
-            data = call(path, payload, timeout=15)
-        except NhplugError as exc:
-            raise NHClientError(f"{label}: NH API 통신 실패 (결과 불확실): {exc}") from exc
-        return _check_business_result(data, label)
+        # NH SDK 자체의 토큰 재시도 뒤에도 네트워크 타임아웃이 나면
+        # 주문이 아닌 조회에 한해 최대 1회만 추가 시도한다.
+        readonly = path.startswith(("/krstock/inquiry/", "/krstock/quote/"))
+        for attempt in range(2 if readonly else 1):
+            try:
+                data = call(path, payload, timeout=15)
+                return _check_business_result(data, label)
+            except NhplugError as exc:
+                kind = classify_nh_failure(exc)
+                if readonly and attempt == 0 and kind in ("network_timeout", "temporary_server_error"):
+                    logger.warning("%s: 일시적 NH API 장애 [%s] — 조회만 1회 재시도", label, kind)
+                    time.sleep(1)
+                    continue
+                # SDK 원본 예외에는 토큰 발급 GET URL과 키가 포함될 수 있다.
+                raise safe_nh_error(label, exc) from None
+        raise NHClientError(f"{label}: 조회 재시도 소진 — 주문 보류")
 
     def get_current_price(self, ticker="069500"):
         data = self._call("/krstock/quote/v1/currentExecution", {
@@ -174,8 +240,8 @@ class NHClient:
                 final_summary = summary
                 if index == 5 and meta.has_next:
                     raise NHClientError("주식잔고조회: 6페이지 초과, 전체 잔고 확인 실패")
-        except NhplugError:
-            raise NHClientError("주식잔고조회: NH API 통신 실패 — 주문 보류") from None
+        except NhplugError as exc:
+            raise safe_nh_error("주식잔고조회", exc) from None
         if not page_seen:
             raise NHClientError("주식잔고조회: 응답 없음 (0주로 추정 금지)")
         if meta.has_next:
@@ -221,7 +287,7 @@ class NHClient:
                 if index == 5 and meta.has_next:
                     raise NHClientError("당일주문조회: 6페이지 초과, 전체 주문 확인 실패")
         except NhplugError as exc:
-            raise NHClientError(f"당일주문조회 실패 — 신규 주문 중단: {exc}") from exc
+            raise safe_nh_error("당일주문조회", exc) from None
         return matching
 
     def submit_order(self, ticker, qty, side, price=0):
